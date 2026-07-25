@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local data
+data/
+outputs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Allow one deliberately tracked test fixture if needed
+!fixtures/synthetic_normalized.sqlite
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
