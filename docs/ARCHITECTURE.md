@@ -142,3 +142,45 @@ Components (all in `src/polymarket/analysis/`):
   `reasoning_confusion_matrix.csv`, `reasoning_calibration.json`,
   `reasoning_failures.json`, `reasoning_manifest.json`,
   `dr_validation_records.jsonl`).
+
+## Production integration of the reasoning layer
+
+`python -m polymarket.cli run-analysis` now runs the full reasoning
+reconstruction, not just Layer 1:
+
+1. Train an artifact once (writes `reasoning_model.json` alongside the
+   validation reports): `python -m polymarket.analysis.reasoning_validation OUT_DIR`
+2. Run analysis with it:
+   `python -m polymarket.cli run-analysis --db DB --output OUT
+    --reasoning-model OUT_DIR/reasoning_model.json
+    --reasoning-target both --run-id my-run`
+
+`load_reasoning_model` verifies the artifact's `feature_version` hash
+against the current feature manifest and REFUSES inference on mismatch
+— a stale model can never silently score fresh features.  The artifact
+carries classes, weights, training standardization, calibration
+temperature, both configurations, version hashes and the training /
+validation world seeds.
+
+`run_replay(reasoning_model=...)` populates `template_posteriors`,
+`counterfactual_results`, `drc_records`, `occurrence_opportunities`,
+`occurrence_attributions` and `occurrence_drc_records`; the CLI persists
+full DRC records through `persist_reasoning_records` (idempotent under a
+stable `--run-id`) and writes `drc_records.jsonl`,
+`occurrence_drc_records.jsonl` and `reasoning_summary.json`.  With
+`--no-reasoning`, Layer-1-only judgments are persisted with the real
+feature hash (never `PARSER_VERSION`).
+
+Every DRC context now records the actual as-of decision environment:
+contract version, market open/closed/trading state, coverage
+certification, blocking-gap count and the outcome-token mapping in
+force.  The occurrence at-risk pair universe is the union of taker
+executions, position events and reported position snapshots, so actors
+holding risk without trading are covered.
+
+Note on real-data acceptance rates: single-market runs with few labeled
+decisions will mark direction-target Layer 1 as `insufficient_context`
+(training rows below `min_train_rows`) and withhold primary templates —
+this is the conservative design working as intended.  Dense multi-market
+data or the occurrence grid (hundreds of intervals) provide enough rows
+for accepted attributions.

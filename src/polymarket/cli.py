@@ -160,6 +160,30 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     from polymarket.analysis.replay import run_replay
     from polymarket.analysis.reporting import audit_database, write_run_outputs
 
+    reasoning_model = None
+    if not args.no_reasoning:
+        if not args.reasoning_model:
+            raise SystemExit(
+                "error: --reasoning-model PATH is required (or pass "
+                "--no-reasoning for Layer-1-only output); train one with "
+                "python -m polymarket.analysis.reasoning_validation OUT_DIR"
+            )
+        from polymarket.analysis.reasoning_artifact import (
+            ArtifactVersionMismatch,
+            load_reasoning_model,
+        )
+
+        try:
+            reasoning_model, _artifact = load_reasoning_model(
+                args.reasoning_model
+            )
+        except FileNotFoundError:
+            raise SystemExit(
+                f"error: reasoning model not found: {args.reasoning_model}"
+            ) from None
+        except ArtifactVersionMismatch as exc:
+            raise SystemExit(f"error: {exc}") from None
+
     reader = SQLiteNormalizedReader(args.db)
     run = run_replay(
         reader,
@@ -167,20 +191,40 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
         interval_seconds=args.interval,
         embargo_seconds=args.embargo,
         seed=args.seed,
+        run_id=args.run_id,
+        reasoning_model=reasoning_model,
+        reasoning_target=args.reasoning_target,
     )
     if run.evaluation is None:
         raise SystemExit(
             "error: analysis produced no evaluation "
             f"({'; '.join(run.notes) or 'insufficient labeled decisions'})"
         )
-    from polymarket.analysis.reasoning import persist_driver_attributions
-    from polymarket.contracts.schema import PARSER_VERSION
+    from polymarket.analysis.versioning import feature_version_hash
 
-    persisted = persist_driver_attributions(
-        reader.conn, run.driver_attributions,
-        feature_version=PARSER_VERSION,
-    )
+    if reasoning_model is not None:
+        from polymarket.analysis.drc import persist_reasoning_records
+
+        persisted = persist_reasoning_records(
+            reader.conn,
+            run.drc_records + run.occurrence_drc_records,
+            reasoning_run_id=run.run_id,
+        )
+    else:
+        # Layer-1-only fallback: still never PARSER_VERSION
+        from polymarket.analysis.reasoning import persist_driver_attributions
+
+        persisted = persist_driver_attributions(
+            reader.conn, run.driver_attributions,
+            feature_version=feature_version_hash(),
+        )
     paths = write_run_outputs(run, args.output)
+    if reasoning_model is not None:
+        from polymarket.analysis.reasoning_reconstruction import (
+            write_reasoning_outputs,
+        )
+
+        paths.update(write_reasoning_outputs(run, args.output))
     audit_path = os.path.join(args.output, "audit_summary.json")
     with open(audit_path, "w") as fh:
         json.dump(audit_database(reader.conn), fh, indent=2)
@@ -249,6 +293,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", type=float, default=3600.0)
     p.add_argument("--embargo", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument(
+        "--reasoning-model",
+        help="path to a reasoning model artifact (reasoning_model.json)",
+    )
+    p.add_argument(
+        "--reasoning-target",
+        choices=["direction", "occurrence", "both"],
+        default="direction",
+    )
+    p.add_argument(
+        "--no-reasoning",
+        action="store_true",
+        help="Layer-1 driver attribution only (no template posterior)",
+    )
+    p.add_argument(
+        "--run-id",
+        help="stable run identifier; reruns with the same id replace "
+             "their own judgments (idempotent)",
+    )
     p.set_defaults(func=cmd_run_analysis)
     return parser
 

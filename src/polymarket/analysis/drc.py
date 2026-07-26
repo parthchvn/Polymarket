@@ -163,6 +163,8 @@ def build_drc_record(
     cf_result: CounterfactualResult | None,
     versions: dict[str, str],
     reasoning_target: str = "direction",
+    contract_version: int | None = None,
+    market_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the full structured (D, C, R) record with final status."""
     evidence = evidence or []
@@ -214,7 +216,8 @@ def build_drc_record(
             "gross_quantity": episode.gross_quantity,
         },
         "C": {
-            "contract_version": None,
+            "contract_version": contract_version,
+            "market_status": market_status or {},
             "market_summary": {
                 "last_price": clean(features.get("mkt_last_price", float("nan"))),
                 "return_short": clean(features.get("mkt_return_short", float("nan"))),

@@ -25,7 +25,8 @@ def test_build_synthetic_audit_and_analysis(tmp_path, capsys):
     assert report["schema_version"] == 1
 
     output = str(tmp_path / "analysis")
-    assert main(["run-analysis", "--db", db, "--output", output]) == 0
+    assert main(["run-analysis", "--db", db, "--output", output,
+                "--no-reasoning"]) == 0
     out = capsys.readouterr().out
     assert "M3" in out and "predictions" in out
 

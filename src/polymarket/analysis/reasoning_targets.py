@@ -72,10 +72,24 @@ def build_at_risk_opportunities(
     """Build the at-risk grid for every (actor, condition) pair in which
     the actor has any taker execution.  Deterministic."""
     conn = reader._conn
+    # the at-risk pair universe is the UNION of every surface through
+    # which an actor can hold risk before an interval: taker executions,
+    # position events (trades, splits, merges, transfers, redemptions)
+    # and reported position snapshots (mapped to conditions through the
+    # outcome-token mapping)
     pairs = conn.execute(
         """
-        SELECT DISTINCT proxy_wallet, condition_id FROM actor_trade_legs
-        WHERE liquidity_role = 'taker'
+        SELECT DISTINCT proxy_wallet, condition_id FROM (
+            SELECT proxy_wallet, condition_id FROM actor_trade_legs
+            WHERE liquidity_role = 'taker'
+            UNION
+            SELECT wallet AS proxy_wallet, condition_id
+            FROM position_events
+            UNION
+            SELECT s.wallet AS proxy_wallet, o.condition_id
+            FROM position_snapshots s
+            JOIN outcome_tokens o ON o.asset = s.asset
+        )
         ORDER BY proxy_wallet, condition_id
         """
     ).fetchall()
