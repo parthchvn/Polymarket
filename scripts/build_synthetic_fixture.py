@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Thin wrapper: python scripts/build_synthetic_fixture.py --db fixtures/synthetic_normalized.sqlite --overwrite"""
+"""Thin wrapper for building the synthetic fixture.
+
+Example:
+    python scripts/build_synthetic_fixture.py \
+        --db fixtures/synthetic_normalized.sqlite \
+        --overwrite
+"""
 import sys
 
 from polymarket.cli import main

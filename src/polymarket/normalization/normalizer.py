@@ -13,7 +13,11 @@ import sqlite3
 from polymarket.contracts.types import NormalizationResult
 from polymarket.normalization.books import normalize_books
 from polymarket.normalization.markets import normalize_market_records
-from polymarket.normalization.news import normalize_news
+from polymarket.normalization.news import (
+    ClaimExtractor,
+    RelevanceScorer,
+    normalize_news,
+)
 from polymarket.normalization.positions import (
     normalize_activity,
     normalize_position_snapshots,
@@ -25,8 +29,16 @@ from polymarket.normalization.trades import (
 
 
 class Normalizer:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        claim_extractor: ClaimExtractor | None = None,
+        relevance_scorer: RelevanceScorer | None = None,
+    ) -> None:
         self._conn = conn
+        self._claim_extractor = claim_extractor
+        self._relevance_scorer = relevance_scorer
 
     # ------------------------------------------------------------------
     def normalize_raw_response(self, raw_response_id: int) -> NormalizationResult:
@@ -76,7 +88,14 @@ class Normalizer:
         elif endpoint == "book" or collector == "books":
             normalize_books(self._conn, raw_row, records, result)
         elif collector.startswith("news") or endpoint.startswith("news"):
-            normalize_news(self._conn, raw_row, records, result)
+            normalize_news(
+                self._conn,
+                raw_row,
+                records,
+                result,
+                extractor=self._claim_extractor,
+                scorer=self._relevance_scorer,
+            )
         else:
             result.errors.append(
                 f"no parser for collector={collector!r} endpoint={endpoint!r}"
