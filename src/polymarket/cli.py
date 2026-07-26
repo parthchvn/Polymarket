@@ -71,8 +71,30 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     from polymarket.normalization.normalizer import Normalizer
     from polymarket.normalization.reconciliation import reconcile_roles
 
+    claim_extractor = None
+    relevance_scorer = None
+
+    if args.news_llm:
+        try:
+            from polymarket.normalization.llm_news import (
+                OllamaClaimExtractor,
+                OllamaRelevanceScorer,
+            )
+        except ImportError as exc:
+            raise SystemExit(
+                'error: install LLM dependencies with '
+                'python -m pip install -e ".[llm]"'
+            ) from exc
+
+        claim_extractor = OllamaClaimExtractor(args.llm_model)
+        relevance_scorer = OllamaRelevanceScorer(args.llm_model)
+
     conn = connect(args.db)
-    results = Normalizer(conn).normalize_all()
+    results = Normalizer(
+        conn,
+        claim_extractor=claim_extractor,
+        relevance_scorer=relevance_scorer,
+    ).normalize_all()
     inserted: dict[str, int] = {}
     unresolved = 0
     for result in results:
@@ -190,6 +212,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("normalize", help="normalize all stored raw responses")
     p.add_argument("--db", required=True)
+    p.add_argument(
+        "--news-llm",
+        action="store_true",
+        help="use a local Ollama model for news extraction and relevance",
+    )
+    p.add_argument(
+        "--llm-model",
+        default="qwen3:8b",
+        help="Ollama model used with --news-llm",
+    )
     p.set_defaults(func=cmd_normalize)
 
     p = sub.add_parser("build-synthetic", help="build the synthetic fixture db")
