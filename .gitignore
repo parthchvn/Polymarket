@@ -1,30 +1,20 @@
-# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.egg-info/
 .venv/
-venv/
-
-# Secrets
 .env
-.env.*
-!.env.example
+.pytest_cache/
+.ruff_cache/
+.coverage
 
-# Local data
-data/
+# never commit production data or secrets
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
 outputs/
-*.db
-*.sqlite
-*.sqlite3
+*.key
+*.pem
 
-# Allow one deliberately tracked test fixture if needed
-!fixtures/synthetic_normalized.sqlite
-
-# macOS
-.DS_Store
-
-# Editors
-.vscode/
-.idea/
+# the synthetic fixture IS committed; ignore its sqlite side files
+fixtures/*.sqlite-wal
+fixtures/*.sqlite-shm
