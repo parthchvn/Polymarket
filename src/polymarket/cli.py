@@ -173,12 +173,20 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
             "error: analysis produced no evaluation "
             f"({'; '.join(run.notes) or 'insufficient labeled decisions'})"
         )
+    from polymarket.analysis.reasoning import persist_driver_attributions
+    from polymarket.contracts.schema import PARSER_VERSION
+
+    persisted = persist_driver_attributions(
+        reader.conn, run.driver_attributions,
+        feature_version=PARSER_VERSION,
+    )
     paths = write_run_outputs(run, args.output)
     audit_path = os.path.join(args.output, "audit_summary.json")
     with open(audit_path, "w") as fh:
         json.dump(audit_database(reader.conn), fh, indent=2)
     paths["audit_summary"] = audit_path
     print(f"run {run.run_id}: {len(run.labeled_episodes)} labeled decisions")
+    print(f"  reasoning judgments persisted: {persisted}")
     for model, metrics in run.evaluation.metrics.items():
         print(
             f"  {model}: log_loss={metrics['log_loss']:.4f} "

@@ -53,3 +53,36 @@ orchestrate runs and write outputs.
 through the SAME normalizer into the SAME schema — never a parallel
 simplified table — producing `fixtures/synthetic_normalized.sqlite` for
 the end-to-end suite.
+
+## Reasoning Layer 1: predictive driver attribution
+
+`analysis/reasoning.py` produces one record per labeled decision
+answering "which feature channels moved the model's probability of the
+observed action?".  This is PREDICTIVE ATTRIBUTION, not mechanism
+inference: a large news contribution alone cannot distinguish immediate
+reaction, delayed underreaction, continuation of a news-caused price
+move, or correlation with an unobserved signal.  Mechanism inference
+(template posteriors such as FRESH_NEWS_REACTION vs
+DELAYED_NEWS_UNDERREACTION) is a later layer; the `reasoning_judgments`
+schema reserves its fields (`primary_template`,
+`template_posterior_json`) as NULL.
+
+Channels: base, actor, market_trend, liquidity, position, and —
+deliberately separated — `fresh_news` (raw 24h components + 6h decay
+kernel) vs `persistent_news` (24h/72h/168h decay kernels), so a fresh
+reaction and delayed adjustment remain distinguishable.
+
+Method per chronological fold (same embargoed expanding-window
+discipline as the nested suite): exact standardized logit contributions
+per channel from the full model, plus refit group-ablation deltas
+`log P(D|C) - log P(D|C without channel)` which double as counterfactual
+results.  Statuses: accepted / ambiguous / insufficient_context /
+counterfactual_failure (plus attribution_template_disagreement, reserved
+for Layer 2+3 agreement checks).
+
+Leakage rule: every model scoring a decision is trained only on strictly
+earlier decisions, and all evidence fields (including
+`aligned_move_since_news`) are computed from the strict pre-decision
+context — post-trade price or liquidity responses never appear in a
+decision's own record.  They may later serve as offline labels for an
+impact classifier, but not as context.

@@ -365,6 +365,30 @@ DDL: list[str] = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS reasoning_judgments (
+        reasoning_judgment_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL,
+        reasoning_run_id TEXT NOT NULL,
+        primary_template TEXT,
+        template_posterior_json TEXT,
+        driver_attribution_json TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        counterfactual_json TEXT,
+        rationale_text TEXT,
+        agreement_score REAL,
+        confidence REAL NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN (
+                'accepted', 'ambiguous', 'insufficient_context',
+                'attribution_template_disagreement', 'counterfactual_failure'
+            )
+        ),
+        model_version TEXT NOT NULL,
+        feature_version TEXT NOT NULL,
+        computed_at REAL NOT NULL
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS relevance_judgments (
         event_family_id TEXT NOT NULL,
         market_id TEXT NOT NULL,
@@ -409,6 +433,7 @@ REQUIRED_TABLES = [
     "news_claims",
     "claim_edges",
     "relevance_judgments",
+    "reasoning_judgments",
 ]
 
 LINEAGE_COLUMNS = ("raw_response_id", "parser_version", "schema_version", "normalized_at")

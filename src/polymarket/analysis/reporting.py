@@ -54,6 +54,26 @@ def write_run_outputs(run: ReplayRun, output_dir: str) -> dict[str, str]:
     config_path.write_text(json.dumps(run.config, indent=2))
     paths["config"] = str(config_path)
 
+    if run.driver_attributions:
+        from polymarket.analysis.reasoning import attribution_report
+
+        reasoning_path = out / "reasoning.json"
+        reasoning_path.write_text(
+            json.dumps(
+                {
+                    "reasoning_run_id": run.run_id,
+                    "method": "predictive driver attribution",
+                    "note": (
+                        "predictive attribution, not mechanism inference; "
+                        "template fields are reserved for a later layer"
+                    ),
+                    "records": attribution_report(run.driver_attributions),
+                },
+                indent=2,
+            )
+        )
+        paths["reasoning"] = str(reasoning_path)
+
     from polymarket.analysis.features import feature_manifest
 
     manifest_path = out / "feature_manifest.json"
@@ -76,9 +96,14 @@ def audit_database(conn: sqlite3.Connection) -> dict:
     report["schema_version"] = row["schema_version"] if row else None
     report["parser_version"] = row["parser_version"] if row else None
 
+    def safe_count(table: str):
+        try:
+            return value(f"SELECT COUNT(*) FROM {table}")
+        except sqlite3.OperationalError:
+            return None  # table absent in a legacy database
+
     report["table_row_counts"] = {
-        table: value(f"SELECT COUNT(*) FROM {table}")
-        for table in REQUIRED_TABLES
+        table: safe_count(table) for table in REQUIRED_TABLES
     }
     report["raw_responses_by_collector"] = {
         r["collector"]: r["n"]

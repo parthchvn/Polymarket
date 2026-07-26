@@ -39,3 +39,11 @@ None of the following may be silently assumed resolved.
     aggregation are MODELLING CHOICES, not established causal
     parameters.  Every run records them in config.json and
     feature_manifest.json; no hidden decay parameters are permitted.
+13. **Driver attribution is not mechanism or causation.** Layer-1
+    records identify which feature channels carried predictive weight
+    for the observed action under the fitted model.  They do not recover
+    the actor's actual reasoning, do not separate immediate reaction
+    from delayed underreaction (that requires the template layer), and
+    are not causal claims.  With few decisions, per-decision ablation
+    deltas are noisy; statuses (ambiguous / counterfactual_failure) must
+    be respected downstream.

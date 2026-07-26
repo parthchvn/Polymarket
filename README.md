@@ -89,6 +89,17 @@ decay parameters are recorded in `config.json` and
 `feature_manifest.json`; the half-lives are modelling choices, not
 established causal parameters.
 
+## Reasoning Layer 1: predictive driver attribution
+
+Each analysis run emits `reasoning.json` and populates the
+`reasoning_judgments` table with one record per labeled decision: exact
+per-channel logit contributions and refit ablation deltas over separate
+channels (base, actor, market_trend, liquidity, position, fresh_news,
+persistent_news), plus strict pre-decision news evidence.  These are
+predictive attributions, not mechanism inference — template posteriors
+(e.g. fresh reaction vs delayed underreaction) are a reserved later
+layer.  No post-trade market response ever enters a decision's record.
+
 ## Data safety
 
 - Raw observations are immutable and append-only.

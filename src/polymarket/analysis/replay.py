@@ -18,6 +18,11 @@ from polymarket.analysis.models import EvaluationResult, evaluate_nested_models
 from polymarket.analysis.news_attribution import attribute_decision
 from polymarket.analysis.placebos import PlaceboSuiteResult, run_placebo_suite
 from polymarket.analysis.reader import SQLiteNormalizedReader
+from polymarket.analysis.reasoning import (
+    DriverAttribution,
+    news_evidence,
+    run_driver_attribution,
+)
 from polymarket.analysis.uncertainty import (
     BootstrapCI,
     cluster_bootstrap,
@@ -33,6 +38,8 @@ class ReplayRun:
     labeled_episodes: list[DecisionEpisode] = field(default_factory=list)
     feature_rows: list[dict] = field(default_factory=list)
     attributions: list[dict] = field(default_factory=list)
+    driver_attributions: list[DriverAttribution] = field(default_factory=list)
+    evidence_by_decision: dict[str, list[dict]] = field(default_factory=dict)
     evaluation: EvaluationResult | None = None
     placebos: PlaceboSuiteResult | None = None
     bootstraps: list[BootstrapCI] = field(default_factory=list)
@@ -101,6 +108,7 @@ def run_replay(
         ids.append(episode.decision_id)
         markets.append(episode.market_id or episode.condition_id)
         actors.append(episode.actor_id)
+        run.evidence_by_decision[episode.decision_id] = news_evidence(context)
         attribution = attribute_decision(context, episode)
         run.attributions.append(
             {
@@ -131,6 +139,11 @@ def run_replay(
     run.placebos = run_placebo_suite(
         run.feature_rows, labels, times, ids, markets, actors,
         baseline=run.evaluation, seed=seed,
+        n_folds=n_folds, embargo_seconds=embargo_seconds,
+    )
+    run.driver_attributions = run_driver_attribution(
+        run.feature_rows, labels, times, ids, run.evidence_by_decision,
+        reasoning_run_id=run.run_id,
         n_folds=n_folds, embargo_seconds=embargo_seconds,
     )
     actor_map = {i: a for i, a in zip(ids, actors)}
