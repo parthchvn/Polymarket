@@ -199,16 +199,16 @@ def test_decay_features_on_synthetic_world(synthetic_db_path):
     # shorter half-life decays at least as fast as longer ones
     assert w1["news_decay_positive_6h"] <= w1["news_decay_positive_168h"]
 
-    # w2's election decision at BASE+60h is the motivating case: the
-    # POSITIVE debate article is ~30.5h old — outside the raw 24h window
-    # (only the negative polls article remains there) — yet it still
-    # contributes a decayed positive signal, so contradictory evidence
-    # from "yesterday" stays visible instead of vanishing at 24h.
+    # w2's election decision at BASE+60h under snapshot semantics: the
+    # alice-carter family's LATEST judgment (the polls article, ~21h old)
+    # supersedes the earlier debate judgment — one judgment per family,
+    # so repeated coverage of one event never multiplies evidence.  The
+    # decayed negative channel is populated; the raw window agrees.
     w2 = by_key[(sc.W2, sc.BASE + 60 * sc.HOUR)]
     assert w2["news_recent_missing"] == 0.0
-    assert w2["news_direction"] == -1.0        # raw window sees polls only
-    assert w2["news_decay_positive_24h"] > 0.0  # decayed debate article
-    assert w2["news_decay_negative_24h"] > 0.0  # decayed polls article
+    assert w2["news_direction"] == -1.0
+    assert w2["news_decay_negative_24h"] > 0.0
+    assert w2["news_decay_positive_24h"] == 0.0  # superseded within family
     assert w2["news_missing"] == w2["news_decay_missing"] == 0.0
 
     # persistent semantic score untouched in the database

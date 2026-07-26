@@ -3,6 +3,7 @@ models -> placebos -> uncertainty -> report files."""
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass, field
 
@@ -19,6 +20,8 @@ from polymarket.analysis.news_attribution import attribute_decision
 from polymarket.analysis.placebos import PlaceboSuiteResult, run_placebo_suite
 from polymarket.analysis.reader import SQLiteNormalizedReader
 from polymarket.analysis.reasoning import (
+    DEFAULT_ATTRIBUTION_CONFIG,
+    AttributionConfig,
     DriverAttribution,
     news_evidence,
     run_driver_attribution,
@@ -59,6 +62,7 @@ def run_replay(
     news_lookback: float = 86400.0,
     news_decay_half_lives: dict[str, float] | None = None,
     news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
+    attribution_config: AttributionConfig = DEFAULT_ATTRIBUTION_CONFIG,
 ) -> ReplayRun:
     end_time = end_time or time.time()
     run = ReplayRun(
@@ -70,6 +74,7 @@ def run_replay(
             "n_folds": n_folds,
             "embargo_seconds": embargo_seconds,
             "seed": seed,
+            "attribution_config": dataclasses.asdict(attribution_config),
             **news_decay_config(
                 news_lookback=news_lookback,
                 news_decay_half_lives=news_decay_half_lives,
@@ -145,6 +150,10 @@ def run_replay(
         run.feature_rows, labels, times, ids, run.evidence_by_decision,
         reasoning_run_id=run.run_id,
         n_folds=n_folds, embargo_seconds=embargo_seconds,
+        config=attribution_config,
+        coverage_by_decision={
+            e.decision_id: e.coverage for e in run.labeled_episodes
+        },
     )
     actor_map = {i: a for i, a in zip(ids, actors)}
     market_map = {i: m for i, m in zip(ids, markets)}

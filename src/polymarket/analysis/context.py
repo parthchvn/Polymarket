@@ -73,13 +73,15 @@ def build_context(
         position=reader.position_asof(episode.actor_id, episode.condition_id, t),
         articles=_rows(reader.articles_asof(t)),
         event_families=_rows(reader.event_families_asof(t)),
-        relevance=_rows(
-            reader.relevance_asof(episode.market_id, t)
-        )
-        if episode.market_id
-        else [],
+        relevance=[],
         coverage=dict(episode.coverage),
     )
+    if episode.market_id and contract is not None:
+        snapshot_rows, version_fallback = reader.relevance_snapshot_asof(
+            episode.market_id, contract["version_seq"], t
+        )
+        context.relevance = _rows(snapshot_rows)
+        context.coverage["relevance_version_fallback"] = version_fallback
     assert_no_future_information(
         {
             "contract": context.contract,

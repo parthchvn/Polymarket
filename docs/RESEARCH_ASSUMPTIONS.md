@@ -47,3 +47,31 @@ None of the following may be silently assumed resolved.
     are not causal claims.  With few decisions, per-decision ablation
     deltas are noisy; statuses (ambiguous / counterfactual_failure) must
     be respected downstream.
+
+## Reasoning-layer assumptions
+
+* **`R` is inferred behaviourally.**  A reasoning judgment asserts only
+  that the observed decision is most consistent with a template under
+  the fitted model.  It is not the actor's private mental state, and
+  rationale text always carries that disclaimer.
+* **Relevance-snapshot version fallback.**  Batch normalization stamps
+  relevance judgments with the newest contract version known at
+  normalization time, so a pipeline that does not recompute judgments
+  per contract version can have zero judgments for the version active
+  at a decision.  `relevance_snapshot_asof` then (by default) falls
+  back to the latest judgment per family across versions — still
+  strictly pre-decision — and flags the fallback in context coverage
+  (`relevance_version_fallback`).  Live forward operation, where news
+  normalizes as it arrives, does not hit this path.
+* **Acceptance is conservative by design.**  Underdetermined fits
+  (training rows below `min_train_rows`), attributions that fail the
+  family-wise permutation-null or fold-mean informativeness gates, weak
+  margins, unstable resamples, or missing evidence all demote a record
+  to `ambiguous` / `insufficient_context` rather than accepting a
+  narrative.  The posterior is retained either way; only the primary
+  template is withheld.
+* **Template recovery is validated on synthetic mechanisms.**  Recovery
+  quality is measured on worlds where the mechanism is true BY
+  CONSTRUCTION; real-data performance depends on decision density and
+  collection coverage and must be re-validated against the live
+  pipeline before any claim is made.

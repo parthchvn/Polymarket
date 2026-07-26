@@ -86,3 +86,59 @@ earlier decisions, and all evidence fields (including
 context — post-trade price or liquidity responses never appear in a
 decision's own record.  They may later serve as offline labels for an
 impact classifier, but not as context.
+
+## Reasoning reconstruction layer (Layer 2)
+
+The reasoning layer produces, for each decision episode, a structured
+`(D, C, R)` record: the observed wallet decision `D`, the strict
+pre-decision context `C`, and a calibrated posterior `R` over structured
+reasoning hypotheses most consistent with `D` and `C` under the fitted
+model.  **`R` is a behavioural inference — "this behaviour is most
+consistent with reasoning template X" — never a claim about the trader's
+private thoughts.**
+
+Components (all in `src/polymarket/analysis/`):
+
+* `reasoning.py` — Layer 1 predictive driver attribution, hardened with
+  optimiser diagnostics (`FitDiagnostics`), configurable acceptance
+  rules (`AttributionConfig`: ablation-delta, margin, block-resample
+  stability, permutation-null and fold-mean informativeness gates, and a
+  minimum-training-rows gate: an underdetermined fit is never trusted),
+  separated prediction vs attribution confidence, and an exact logit
+  decomposition (`sigmoid(intercept + sum(channel contributions))`
+  reconstructs the predicted probability).
+* `reasoning_templates.py` — the frozen template ontology (nine
+  observationally honest hypotheses; delayed news alignment is
+  `PERSISTENT_NEWS_ADJUSTMENT`, never a causal "underreaction" label).
+* `reasoning_posterior.py` — deterministic class-balanced multinomial
+  posterior over templates with training-only standardization, L2
+  regularization, and scalar temperature calibration fitted on held-out
+  synthetic VALIDATION worlds (never on test worlds).  Primary templates
+  are withheld (`None`) when gating fails (top probability, margin,
+  entropy, Layer 1 not accepted, incomplete coverage).
+* `reasoning_counterfactuals.py` — fixed-model context interventions
+  (`remove_fresh_news`, `flatten_market_trend`, `neutralise_position`,
+  ...), deliberately distinct from refit ablation, with missingness
+  semantics preserved.  Each template declares required counterfactuals;
+  a failed requirement demotes the record to `counterfactual_failure`.
+* `reasoning_targets.py` — the occurrence target: an at-risk interval
+  grid (market open, coverage certified, actor engaged) feeding a
+  separate `P(trade | at-risk, C)` head.  Occurrence pseudo-episodes are
+  `direction=None` and structurally cannot enter the direction model.
+* `drc.py` / `rationale.py` — structured DRC record assembly,
+  attribution-template agreement scoring (disagreement is surfaced as
+  `attribution_template_disagreement`, never smoothed into a narrative),
+  idempotent persistence into `reasoning_judgments` (the `confidence`
+  column stores final reasoning confidence), and a deterministic
+  rationale renderer (no LLM chooses templates or evidence).
+* `versioning.py` — SHA-256 identities: `feature_version`,
+  `reasoning_method_version`, `template_ontology_version`,
+  `synthetic_generator_version`.  `PARSER_VERSION` is never reused.
+* `reasoning_validation.py` — the synthetic validation harness:
+  ground-truth worlds (`synthetic/reasoning_worlds.py`) with known
+  mechanisms by construction, split by world seed, Layer 1 trained on
+  pooled cross-world rows (leave-one-world-out for training worlds),
+  and the six report files (`reasoning_metrics.json`,
+  `reasoning_confusion_matrix.csv`, `reasoning_calibration.json`,
+  `reasoning_failures.json`, `reasoning_manifest.json`,
+  `dr_validation_records.jsonl`).
