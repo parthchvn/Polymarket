@@ -285,6 +285,24 @@ def run_reasoning_validation(
         "test_examples": len(eval_rows),
     }
 
+    from polymarket.analysis.reasoning_artifact import (
+        build_artifact_payload,
+        save_reasoning_model,
+    )
+
+    artifact_path = save_reasoning_model(
+        build_artifact_payload(
+            model,
+            attribution_config=DEFAULT_ATTRIBUTION_CONFIG,
+            posterior_config=DEFAULT_POSTERIOR_CONFIG,
+            versions=versions,
+            train_world_seeds=train_seeds,
+            validation_world_seeds=val_seeds,
+        ),
+        os.path.join(output_dir, "reasoning_model.json"),
+    )
+    manifest["model_artifact"] = artifact_path
+
     _write_json(os.path.join(output_dir, "reasoning_metrics.json"), metrics)
     _write_json(
         os.path.join(output_dir, "reasoning_calibration.json"), calibration

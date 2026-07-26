@@ -47,6 +47,16 @@ class ReplayRun:
     placebos: PlaceboSuiteResult | None = None
     bootstraps: list[BootstrapCI] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # reasoning reconstruction surfaces (populated when a reasoning
+    # model artifact is supplied)
+    template_posteriors: list = field(default_factory=list)
+    counterfactual_results: list = field(default_factory=list)
+    drc_records: list[dict] = field(default_factory=list)
+    occurrence_opportunities: list = field(default_factory=list)
+    occurrence_attributions: list[DriverAttribution] = field(
+        default_factory=list
+    )
+    occurrence_drc_records: list[dict] = field(default_factory=list)
 
 
 def run_replay(
@@ -63,6 +73,8 @@ def run_replay(
     news_decay_half_lives: dict[str, float] | None = None,
     news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
     attribution_config: AttributionConfig = DEFAULT_ATTRIBUTION_CONFIG,
+    reasoning_model=None,
+    reasoning_target: str = "direction",
 ) -> ReplayRun:
     end_time = end_time or time.time()
     run = ReplayRun(
@@ -155,6 +167,21 @@ def run_replay(
             e.decision_id: e.coverage for e in run.labeled_episodes
         },
     )
+
+    if reasoning_model is not None:
+        from polymarket.analysis.reasoning_reconstruction import (
+            run_reasoning_reconstruction,
+        )
+
+        run_reasoning_reconstruction(
+            run, reader, reasoning_model,
+            reasoning_target=reasoning_target,
+            attribution_config=attribution_config,
+        )
+    else:
+        run.notes.append(
+            "reasoning reconstruction skipped: no reasoning model artifact"
+        )
     actor_map = {i: a for i, a in zip(ids, actors)}
     market_map = {i: m for i, m in zip(ids, markets)}
     run.bootstraps = [
