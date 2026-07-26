@@ -45,7 +45,10 @@ def normalize_books(
     raw_id = int(raw_row["raw_response_id"])
     observed_at = float(raw_row["received_at"])
     for index, record in enumerate(records):
-        asset = record.get("asset") or record.get("token_id")
+        asset = (
+            record.get("asset") or record.get("token_id")
+            or record.get("asset_id")  # production CLOB key
+        )
         if asset is None:
             result.unresolved.append(
                 {"table": "order_book_snapshots", "index": index,

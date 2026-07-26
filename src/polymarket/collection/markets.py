@@ -20,7 +20,9 @@ def collect_markets(
 ) -> PaginationOutcome:
     params: dict[str, Any] = {}
     if condition_ids:
-        params["condition_ids"] = ",".join(condition_ids)
+        # gamma requires REPEATED condition_ids params; a comma-joined
+        # value silently matches nothing (verified against production)
+        params["condition_ids"] = list(condition_ids)
     return paginate_offset(
         _fetch_factory(client, MARKETS_ENDPOINT, base_key="gamma"),
         base_params=params,

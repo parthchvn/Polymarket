@@ -43,8 +43,10 @@ _STATUS_TEXT = {
         "selection."
     ),
     "insufficient_context": (
-        "The pre-decision context was not coverage-complete, so no "
-        "reasoning hypothesis is asserted."
+        "No trustworthy model was available for this decision — the "
+        "pre-decision context was incomplete, or there were too few "
+        "comparable decisions to fit one — so no reasoning hypothesis "
+        "is asserted."
     ),
     "counterfactual_failure": (
         "The leading reasoning hypothesis failed its required "

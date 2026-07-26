@@ -62,7 +62,14 @@ class Normalizer:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             result.errors.append(f"undecodable payload: {exc}")
             return result
-        records = body if isinstance(body, list) else body.get("data", [])
+        if isinstance(body, list):
+            records = body
+        elif isinstance(body, dict):
+            # {"data": [...]} envelopes unwrap; bare object payloads
+            # (e.g. a single CLOB order book) normalize as one record
+            records = body.get("data", body)
+        else:
+            records = []
         if not isinstance(records, list):
             records = [records]
 
