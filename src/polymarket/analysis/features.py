@@ -9,6 +9,7 @@ substantive zero.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from polymarket.analysis.context import DecisionContext
@@ -41,10 +42,142 @@ FEATURE_GROUPS = {
         "news_source_diversity", "news_confirmation_count",
         "news_contradiction_count", "news_article_count",
         "news_ingestion_lag", "news_missing",
+        "news_recent_missing", "news_decay_missing",
+        "news_decay_signed_6h", "news_decay_positive_6h",
+        "news_decay_negative_6h",
+        "news_decay_signed_24h", "news_decay_positive_24h",
+        "news_decay_negative_24h",
+        "news_decay_signed_72h", "news_decay_positive_72h",
+        "news_decay_negative_72h",
+        "news_decay_signed_168h", "news_decay_positive_168h",
+        "news_decay_negative_168h",
     ],
 }
 
 ALL_FEATURES = [f for group in FEATURE_GROUPS.values() for f in group]
+
+# ---------------------------------------------------------------------------
+# News time decay.
+#
+# The permanent semantic relevance judgment (relevance_judgments.rel_score)
+# is NEVER modified.  A decision-specific dynamic weight is recomputed for
+# every decision from the age of the news at that decision, using half-life
+# decay over multiple horizons so the model can learn whether short-lived
+# or persistent news matters.  These half-lives are modelling choices, not
+# established causal parameters (see docs/RESEARCH_ASSUMPTIONS.md).
+
+NEWS_DECAY_HALF_LIVES = {
+    "6h": 6 * 3600.0,
+    "24h": 24 * 3600.0,
+    "72h": 72 * 3600.0,
+    "168h": 168 * 3600.0,
+}
+
+NEWS_DECAY_MAX_AGE = 28 * 86400.0
+
+NEWS_DECAY_AGGREGATION = "event_family_max_positive_negative"
+
+
+def half_life_decay(age_seconds: float, half_life_seconds: float) -> float:
+    """Half-life decay weight: 0.5 ** (age / half_life)."""
+    if half_life_seconds <= 0:
+        raise ValueError("half_life_seconds must be positive")
+    return 2.0 ** (-float(age_seconds) / float(half_life_seconds))
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a sqlite3.Row or a plain dict."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
+
+
+def relevance_confidence(row: Any) -> float:
+    """Confidence stored in evidence_json, defaulting safely to 1.0.
+
+    Malformed or missing JSON must never crash feature construction.
+    """
+    raw = _row_get(row, "evidence_json")
+    if not raw:
+        return 1.0
+    try:
+        evidence = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return 1.0
+    if not isinstance(evidence, dict):
+        return 1.0
+    confidence = evidence.get("confidence", 1.0)
+    try:
+        return min(max(float(confidence), 0.0), 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def decayed_news_signals(
+    relevance_rows: Any,
+    *,
+    decision_time: float,
+    half_life_seconds: float,
+    max_age_seconds: float = NEWS_DECAY_MAX_AGE,
+) -> dict[str, float]:
+    """Event-family-deduplicated, time-decayed news signals.
+
+    Row eligibility (defensive even though the strict reader already
+    enforces the temporal rule): age = decision_time - computed_at must be
+    strictly positive — rows exactly at or after the decision time
+    contribute nothing — and at most ``max_age_seconds``; irrelevant rows
+    are excluded.
+
+    Per-row signed evidence is
+    ``rel_score * direction * novelty * confidence * decay`` with all
+    inputs clamped.  Rows are grouped by event_family_id; within a family
+    the positive and negative components each take the MAX row
+    contribution (duplicate articles must not multiply the signal), and
+    distinct families sum (independent events may add).  Positive and
+    negative evidence are kept separate so contradictions stay visible.
+    """
+    family_positive: dict[str, float] = {}
+    family_negative: dict[str, float] = {}
+    for index, row in enumerate(relevance_rows):
+        if _row_get(row, "rel_class") == "irrelevant":
+            continue
+        computed_at = _row_get(row, "computed_at")
+        if computed_at is None:
+            continue
+        age_seconds = decision_time - float(computed_at)
+        if age_seconds <= 0 or age_seconds > max_age_seconds:
+            continue
+        relevance = min(max(float(_row_get(row, "rel_score", 0.0)), 0.0), 1.0)
+        direction = min(max(float(_row_get(row, "direction", 0.0)), -1.0), 1.0)
+        novelty_raw = _row_get(row, "novelty")
+        novelty = (
+            1.0 if novelty_raw is None
+            else min(max(float(novelty_raw), 0.0), 1.0)
+        )
+        confidence = relevance_confidence(row)
+        decay = half_life_decay(age_seconds, half_life_seconds)
+        contribution = relevance * direction * novelty * confidence * decay
+        family_key = _row_get(row, "event_family_id") or f"unfamilied:{index}"
+        if contribution > 0:
+            family_positive[family_key] = max(
+                family_positive.get(family_key, 0.0), contribution
+            )
+            family_negative.setdefault(family_key, 0.0)
+        else:
+            family_negative[family_key] = max(
+                family_negative.get(family_key, 0.0), -contribution
+            )
+            family_positive.setdefault(family_key, 0.0)
+    total_positive = sum(family_positive.values())
+    total_negative = sum(family_negative.values())
+    return {
+        "signed": total_positive - total_negative,
+        "positive": total_positive,
+        "negative": total_negative,
+        "family_count": float(len(family_positive)),
+    }
 
 
 def _sign_by_asset(context: DecisionContext) -> dict[str, int]:
@@ -62,6 +195,8 @@ def compute_features(
     recent_window: float = 86400.0,
     short_horizon: float = 3600.0,
     news_lookback: float = 86400.0,
+    news_decay_half_lives: dict[str, float] | None = None,
+    news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
 ) -> dict[str, float]:
     t = context.decision_time
     f: dict[str, float] = {name: 0.0 for name in ALL_FEATURES}
@@ -169,13 +304,17 @@ def compute_features(
     )
 
     # ---- news (components kept separate; zero-preserving sparse coding) --
+    # Raw recent-window (24h) features are retained for backwards
+    # compatibility and interpretability; decayed features below extend
+    # the horizon to news_decay_max_age with half-life weighting.
     relevant = [
         r for r in context.relevance
-        if r["computed_at"] >= t - news_lookback
+        if r["computed_at"] < t  # defensive: never at/after decision time
+        and r["computed_at"] >= t - news_lookback
         and r["rel_class"] not in ("irrelevant",)
     ]
+    f["news_recent_missing"] = 0.0 if relevant else 1.0
     if relevant:
-        f["news_missing"] = 0.0
         f["news_rel_max"] = max(r["rel_score"] for r in relevant)
         f["news_rel_sum"] = sum(r["rel_score"] for r in relevant)
         top = max(relevant, key=lambda r: r["rel_score"])
@@ -195,8 +334,30 @@ def compute_features(
                 if any(d > 0 for d in ds) and any(d < 0 for d in ds)
             )
         )
-    else:
-        f["news_missing"] = 1.0
+
+    # ---- decayed news signals (event-family deduplicated) ---------------
+    half_lives = (
+        dict(NEWS_DECAY_HALF_LIVES)
+        if news_decay_half_lives is None
+        else dict(news_decay_half_lives)
+    )
+    decay_family_count = 0.0
+    for label, half_life_seconds in half_lives.items():
+        signals = decayed_news_signals(
+            context.relevance,
+            decision_time=t,
+            half_life_seconds=half_life_seconds,
+            max_age_seconds=news_decay_max_age,
+        )
+        f[f"news_decay_signed_{label}"] = signals["signed"]
+        f[f"news_decay_positive_{label}"] = signals["positive"]
+        f[f"news_decay_negative_{label}"] = signals["negative"]
+        decay_family_count = max(decay_family_count, signals["family_count"])
+    f["news_decay_missing"] = 0.0 if decay_family_count > 0 else 1.0
+    # news_missing now means: no news information is available to ANY news
+    # feature used by the model (i.e. it equals news_decay_missing).  The
+    # old 24-hour-only semantics live in news_recent_missing.
+    f["news_missing"] = f["news_decay_missing"]
 
     articles = [
         a for a in context.articles
@@ -218,5 +379,28 @@ def feature_subset(features: dict[str, float], groups: list[str]) -> dict[str, f
     return {n: features[n] for n in names}
 
 
+def news_decay_config(
+    *,
+    news_lookback: float = 86400.0,
+    news_decay_half_lives: dict[str, float] | None = None,
+    news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
+) -> dict[str, Any]:
+    half_lives = (
+        dict(NEWS_DECAY_HALF_LIVES)
+        if news_decay_half_lives is None
+        else dict(news_decay_half_lives)
+    )
+    return {
+        "news_recent_lookback_seconds": news_lookback,
+        "news_decay_max_age_seconds": news_decay_max_age,
+        "news_decay_half_lives_seconds": half_lives,
+        "news_decay_aggregation": NEWS_DECAY_AGGREGATION,
+    }
+
+
 def feature_manifest() -> dict[str, Any]:
-    return {"groups": FEATURE_GROUPS, "all_features": ALL_FEATURES}
+    return {
+        "groups": FEATURE_GROUPS,
+        "all_features": ALL_FEATURES,
+        "news_decay": news_decay_config(),
+    }

@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 
 from polymarket.analysis.context import build_context
 from polymarket.analysis.decisions import DecisionEpisode, build_decision_episodes
-from polymarket.analysis.features import compute_features, feature_manifest
+from polymarket.analysis.features import (
+    NEWS_DECAY_MAX_AGE,
+    compute_features,
+    feature_manifest,
+    news_decay_config,
+)
 from polymarket.analysis.models import EvaluationResult, evaluate_nested_models
 from polymarket.analysis.news_attribution import attribute_decision
 from polymarket.analysis.placebos import PlaceboSuiteResult, run_placebo_suite
@@ -44,6 +49,9 @@ def run_replay(
     embargo_seconds: float = 0.0,
     seed: int = 1337,
     run_id: str | None = None,
+    news_lookback: float = 86400.0,
+    news_decay_half_lives: dict[str, float] | None = None,
+    news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
 ) -> ReplayRun:
     end_time = end_time or time.time()
     run = ReplayRun(
@@ -55,6 +63,11 @@ def run_replay(
             "n_folds": n_folds,
             "embargo_seconds": embargo_seconds,
             "seed": seed,
+            **news_decay_config(
+                news_lookback=news_lookback,
+                news_decay_half_lives=news_decay_half_lives,
+                news_decay_max_age=news_decay_max_age,
+            ),
         },
     )
     run.episodes = build_decision_episodes(
@@ -74,7 +87,13 @@ def run_replay(
             # from the direction model but retained in the episode list.
             continue
         context = build_context(reader, episode)
-        features = compute_features(context, episode)
+        features = compute_features(
+            context,
+            episode,
+            news_lookback=news_lookback,
+            news_decay_half_lives=news_decay_half_lives,
+            news_decay_max_age=news_decay_max_age,
+        )
         run.labeled_episodes.append(episode)
         run.feature_rows.append(features)
         labels.append(1.0 if episode.direction == "positive" else -1.0)

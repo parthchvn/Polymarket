@@ -115,14 +115,23 @@ def run_placebo_suite(
         shifted.append(new_row)
     record("pseudo_event_times", shifted, "news ages shifted earlier in time", seed + 1)
 
-    # 26.3 irrelevant-market news: zero the relevance channel (keep counts)
+    # 26.3 irrelevant-market news: blank every relevance-derived channel
+    # (raw and decayed) while keeping article counts, as if all observed
+    # news had been judged irrelevant to the market.
+    relevance_channels = tuple(
+        name for name in NEWS_FEATURES
+        if not name.endswith("_missing")
+        and name not in ("news_article_count", "news_source_diversity",
+                         "news_ingestion_lag")
+    )
     irrelevant = []
     for row in feature_rows:
         new_row = dict(row)
-        for name in ("news_rel_max", "news_rel_sum", "news_direction",
-                     "news_novelty_max", "news_surprise_max"):
+        for name in relevance_channels:
             new_row[name] = 0.0
-        new_row["news_missing"] = 1.0
+        for name in ("news_missing", "news_recent_missing",
+                     "news_decay_missing"):
+            new_row[name] = 1.0
         irrelevant.append(new_row)
     record("irrelevant_market_news", irrelevant,
            "relevance channel replaced by irrelevant-news coding", seed)

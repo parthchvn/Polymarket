@@ -34,3 +34,8 @@ None of the following may be silently assumed resolved.
     mocked/synthetic payloads only in this implementation; live response
     shapes (field names, pagination behaviour, status semantics) remain
     to be validated with `pytest -m live` style probes.
+12. **News decay parameters.** The half-lives (6h/24h/72h/168h), the
+    28-day maximum age, and the event-family max-positive/max-negative
+    aggregation are MODELLING CHOICES, not established causal
+    parameters.  Every run records them in config.json and
+    feature_manifest.json; no hidden decay parameters are permitted.

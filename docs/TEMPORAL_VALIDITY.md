@@ -44,3 +44,30 @@ Strict inequality, never `<=`.  Rows exactly at the cutoff are excluded.
 Publication time is not first collector availability.  All news
 attachment uses `first_observed_at < decision_time`.  Ingestion lag
 (`first_observed_at - source_published_at`) is retained and audited.
+
+## Time-decayed news features
+
+The permanent semantic relevance score in `relevance_judgments` is never
+modified.  At decision time, a SEPARATE dynamic weight is recomputed per
+decision from the age of each judgment:
+
+```python
+decay = 2.0 ** (-(decision_time - computed_at) / half_life_seconds)
+```
+
+Rules:
+
+* eligibility is defensive as well as reader-enforced: rows with
+  `computed_at >= decision_time` contribute exactly zero, even if they
+  somehow reach the feature code;
+* four half-lives (6h, 24h, 72h, 168h) are exposed side by side so the
+  model can learn the persistence of news value;
+* decayed news is capped at a 28-day maximum age;
+* the raw 24-hour features remain unchanged for backwards compatibility
+  (`news_recent_missing` carries their old missingness semantics, while
+  `news_missing` now equals `news_decay_missing` — "no news information
+  is available to any news feature");
+* rows are aggregated per `event_family_id` (max positive and max
+  negative within a family, sum across families) so duplicate articles
+  do not multiply the signal, while positive and negative evidence stay
+  separately visible.

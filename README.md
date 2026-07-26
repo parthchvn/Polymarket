@@ -76,6 +76,19 @@ News availability is `first_observed_at` (collector time), never
 publication time.  A runtime assertion rejects contaminated contexts.
 See `docs/TEMPORAL_VALIDITY.md`.
 
+## Time-decayed news features
+
+Semantic relevance is permanent (`relevance_judgments` is never
+rewritten); the decision-specific news signal decays with age using
+half-life weighting over four horizons (6h, 24h, 72h, 168h, capped at 28
+days), so yesterday's news can still inform today's decision at reduced
+weight.  Evidence is aggregated per event family (duplicates take the
+max, independent events add) and positive/negative components remain
+separate.  No news at or after the decision time ever contributes.  All
+decay parameters are recorded in `config.json` and
+`feature_manifest.json`; the half-lives are modelling choices, not
+established causal parameters.
+
 ## Data safety
 
 - Raw observations are immutable and append-only.
