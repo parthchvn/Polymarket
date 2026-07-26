@@ -62,15 +62,38 @@ class Standardizer:
 
 
 @dataclass
+class FitDiagnostics:
+    success: bool
+    status: int
+    message: str
+    objective: float
+    gradient_norm: float
+    iterations: int
+
+
+@dataclass
 class LogisticModel:
-    """L2-regularized logistic regression via scipy L-BFGS (deterministic)."""
+    """L2-regularized logistic regression via scipy L-BFGS (deterministic).
+
+    A fit is never silently accepted: ``diagnostics`` records optimiser
+    success, and ``fit_ok`` is False for a failed optimiser, non-finite
+    coefficients, or non-finite training probabilities.  Callers that
+    make attribution claims MUST check ``fit_ok``.
+    """
 
     feature_names: list[str]
     l2: float = 1.0
     weights: np.ndarray | None = None
     standardizer: Standardizer | None = None
+    diagnostics: FitDiagnostics | None = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "LogisticModel":
+    @property
+    def fit_ok(self) -> bool:
+        return self.diagnostics is not None and self.diagnostics.success
+
+    def fit(
+        self, X: np.ndarray, y: np.ndarray, *, max_iter: int = 200
+    ) -> "LogisticModel":
         self.standardizer = Standardizer(self.feature_names).fit(X)
         Xs = np.column_stack(
             [np.ones(len(X)), self.standardizer.transform(X)]
@@ -92,8 +115,27 @@ class LogisticModel:
             return g
 
         w0 = np.zeros(Xs.shape[1])
-        res = minimize(loss, w0, jac=grad, method="L-BFGS-B")
+        res = minimize(
+            loss, w0, jac=grad, method="L-BFGS-B",
+            options={"maxiter": max_iter},
+        )
         self.weights = res.x
+        finite_weights = bool(np.all(np.isfinite(res.x)))
+        train_probs_finite = True
+        if finite_weights:
+            z = Xs @ res.x
+            train_probs_finite = bool(
+                np.all(np.isfinite(1.0 / (1.0 + np.exp(-z))))
+            )
+        gradient = grad(res.x) if finite_weights else np.array([np.inf])
+        self.diagnostics = FitDiagnostics(
+            success=bool(res.success) and finite_weights and train_probs_finite,
+            status=int(res.status),
+            message=str(res.message),
+            objective=float(res.fun) if np.isfinite(res.fun) else float("inf"),
+            gradient_norm=float(np.linalg.norm(gradient)),
+            iterations=int(res.nit),
+        )
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -102,7 +144,8 @@ class LogisticModel:
         Xs = np.column_stack(
             [np.ones(len(X)), self.standardizer.transform(X)]
         )
-        return 1.0 / (1.0 + np.exp(-(Xs @ self.weights)))
+        z = np.clip(Xs @ self.weights, -500.0, 500.0)
+        return 1.0 / (1.0 + np.exp(-z))
 
 
 # ---------------------------------------------------------------------------

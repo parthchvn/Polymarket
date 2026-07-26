@@ -212,6 +212,75 @@ class SQLiteNormalizedReader:
             (cutoff,),
         ).fetchall()
 
+    def relevance_snapshot_asof(
+        self,
+        market_id: str,
+        contract_version_seq: int,
+        cutoff: float,
+        method: str | None = None,
+        model_version: str | None = None,
+        allow_version_fallback: bool = True,
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Exactly one judgment per event family, strictly before cutoff.
+
+        Primary rule: only judgments computed against the contract version
+        active at the decision are eligible (obsolete contract-version
+        judgments are excluded); the LATEST computed_at per family wins,
+        so repeated recomputations never multiply news evidence; method /
+        model_version restrict to approved scorers when configured.
+
+        Fallback: batch normalization stamps judgments with the newest
+        contract version known at normalization time, so a pipeline that
+        does not recompute judgments per contract version may have zero
+        judgments for the active version.  When ``allow_version_fallback``
+        is set and the primary rule matches nothing, the latest judgment
+        per family across versions (still strictly before the cutoff) is
+        returned and the second element of the result is True so callers
+        can flag the mismatch.  See docs/RESEARCH_ASSUMPTIONS.md.
+
+        Returns (rows, used_version_fallback).
+        """
+
+        def query(version_clause: str, version_args: list) -> list[sqlite3.Row]:
+            extra = ""
+            extra_args: list = []
+            if method is not None:
+                extra += " AND method = ?"
+                extra_args.append(method)
+            if model_version is not None:
+                extra += " AND model_version = ?"
+                extra_args.append(model_version)
+            inner_extra = extra.replace("method", "r2.method").replace(
+                "model_version", "r2.model_version"
+            )
+            sql = f"""
+                SELECT r.* FROM relevance_judgments r
+                WHERE r.market_id = ? AND r.computed_at < ?
+                  {version_clause.replace('contract_version_seq',
+                                          'r.contract_version_seq')}
+                  {extra.replace('method', 'r.method').replace(
+                      'model_version', 'r.model_version')}
+                  AND r.computed_at = (
+                      SELECT MAX(r2.computed_at) FROM relevance_judgments r2
+                      WHERE r2.event_family_id = r.event_family_id
+                        AND r2.market_id = r.market_id AND r2.computed_at < ?
+                        {version_clause.replace('contract_version_seq',
+                                                'r2.contract_version_seq')}
+                        {inner_extra}
+                  )
+                ORDER BY r.event_family_id
+            """
+            args = (
+                [market_id, cutoff] + version_args + extra_args
+                + [cutoff] + version_args + extra_args
+            )
+            return self._conn.execute(sql, args).fetchall()
+
+        rows = query("AND contract_version_seq = ?", [contract_version_seq])
+        if rows or not allow_version_fallback:
+            return rows, False
+        return query("", []), True
+
     def relevance_asof(self, market_id: str, cutoff: float) -> list[sqlite3.Row]:
         return self._conn.execute(
             """

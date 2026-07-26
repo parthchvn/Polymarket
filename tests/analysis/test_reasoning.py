@@ -61,7 +61,10 @@ def test_ablating_the_informative_channel_hurts_most():
     records = run_driver_attribution(
         rows, labels, times, ids, {}, reasoning_run_id="r1"
     )
-    evaluated = [r for r in records if r.status != "insufficient_context"]
+    # small-n fits are (correctly) not trusted for acceptance, but the
+    # ablation deltas are still computed and reported for every
+    # evaluated decision
+    evaluated = [r for r in records if r.group_attributions]
     assert evaluated
     # the label is a deterministic function of the persistent-news channel,
     # so its ablation delta should dominate for most evaluated decisions

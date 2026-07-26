@@ -71,3 +71,21 @@ Rules:
   negative within a family, sum across families) so duplicate articles
   do not multiply the signal, while positive and negative evidence stay
   separately visible.
+
+## Reasoning-layer temporal guarantees
+
+* The relevance surface used by contexts is `relevance_snapshot_asof`:
+  exactly one judgment per event family, judged against the contract
+  version active at the decision, `computed_at` strictly before the
+  decision (a judgment at exactly the decision time is excluded), latest
+  recomputation wins — repeated recomputations never multiply evidence.
+* Posterior inputs are strictly pre-decision: Layer 1 deltas and
+  contributions, decision direction, pre-decision position/exposure,
+  news evidence with age and alignment, pre-decision trend and
+  liquidity, actor history, and coverage indicators.  Post-decision
+  price movement, market outcomes, future wallet trades, later news and
+  resolution results are never inputs (tested by inserting post-decision
+  rows and asserting identical reasoning inputs).
+* Synthetic validation splits are by WORLD SEED; no episode from one
+  world appears on both sides, and thresholds are never tuned on the
+  held-out test worlds.
