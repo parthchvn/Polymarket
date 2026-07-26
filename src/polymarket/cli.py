@@ -1,0 +1,222 @@
+"""Command-line interface.
+
+Commands: init-db, collect, normalize, build-synthetic, audit,
+run-analysis.  Expected user errors exit nonzero without stack traces.
+No secrets are read from the command line or logged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+from polymarket.contracts.schema import connect, init_db
+
+
+def _require_db(path: str) -> None:
+    if not os.path.exists(path):
+        raise SystemExit(f"error: database not found: {path}")
+
+
+def cmd_init_db(args: argparse.Namespace) -> int:
+    directory = os.path.dirname(args.db)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = init_db(args.db)
+    conn.close()
+    print(f"initialized schema in {args.db}")
+    return 0
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    _require_db(args.db)
+    from polymarket.collection.client import ObservingClient
+    from polymarket.collection.raw_store import (
+        finish_collector_run,
+        start_collector_run,
+    )
+    from polymarket.collection.trades import collect_trades
+
+    conn = connect(args.db)
+    if args.surface != "trades":
+        raise SystemExit(
+            f"error: surface {args.surface!r} not wired for CLI collection yet; "
+            "supported: trades"
+        )
+    if not args.condition_id:
+        raise SystemExit("error: --condition-id is required for trades")
+    for taker_only in (True, False):
+        collector = "trades_taker" if taker_only else "trades_expanded"
+        run_id = start_collector_run(
+            conn, collector,
+            {"condition_id": args.condition_id, "takerOnly": taker_only},
+        )
+        with ObservingClient(conn, collector, run_id) as client:
+            outcome = collect_trades(
+                client, condition_id=args.condition_id, taker_only=taker_only
+            )
+        status = "succeeded" if outcome.status == "complete" else "partial"
+        finish_collector_run(conn, run_id, status, note=outcome.note)
+        print(
+            f"{collector}: {outcome.record_count} records over "
+            f"{len(outcome.pages)} pages ({outcome.status})"
+        )
+    return 0
+
+
+def cmd_normalize(args: argparse.Namespace) -> int:
+    _require_db(args.db)
+    from polymarket.normalization.normalizer import Normalizer
+    from polymarket.normalization.reconciliation import reconcile_roles
+
+    conn = connect(args.db)
+    results = Normalizer(conn).normalize_all()
+    inserted: dict[str, int] = {}
+    unresolved = 0
+    for result in results:
+        for table, n in result.inserted.items():
+            inserted[table] = inserted.get(table, 0) + n
+        unresolved += len(result.unresolved)
+    diag = reconcile_roles(conn)
+    print(f"normalized {len(results)} raw responses")
+    for table, n in sorted(inserted.items()):
+        print(f"  {table}: {n} inserted")
+    print(f"  unresolved records: {unresolved}")
+    print(
+        f"  roles: {diag.taker_assigned} taker, {diag.maker_assigned} maker, "
+        f"{diag.unknown_remaining} unknown"
+    )
+    return 0
+
+
+def cmd_build_synthetic(args: argparse.Namespace) -> int:
+    from polymarket.synthetic.fixtures import build_synthetic_fixture
+
+    try:
+        conn = build_synthetic_fixture(args.db, overwrite=args.overwrite)
+    except FileExistsError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    n = conn.execute("SELECT COUNT(*) FROM raw_responses").fetchone()[0]
+    print(f"built synthetic fixture at {args.db} ({n} raw responses)")
+    return 0
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    _require_db(args.db)
+    from polymarket.analysis.reporting import audit_database
+
+    conn = connect(args.db)
+    report = audit_database(conn)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"schema version: {report['schema_version']}")
+        print(f"parser version: {report['parser_version']}")
+        print("table row counts:")
+        for table, count in report["table_row_counts"].items():
+            print(f"  {table}: {count}")
+        print(f"raw responses by collector: {report['raw_responses_by_collector']}")
+        print(f"http status distribution: {report['http_status_distribution']}")
+        print(f"collector gaps: {report['collector_gaps']}")
+        print(f"backfill windows: {report['backfill']}")
+        print(f"unknown-role legs: {report['unknown_role_legs']}")
+        print(f"unresolved position events: {report['unresolved_position_events']}")
+        print(
+            "markets missing outcome mappings: "
+            f"{report['markets_missing_outcome_mappings']}"
+        )
+        print(f"contract version counts: {report['contract_version_counts']}")
+        print(f"news ingestion lag: {report['news_ingestion_lag']}")
+    return 0
+
+
+def cmd_run_analysis(args: argparse.Namespace) -> int:
+    _require_db(args.db)
+    from polymarket.analysis.reader import SQLiteNormalizedReader
+    from polymarket.analysis.replay import run_replay
+    from polymarket.analysis.reporting import audit_database, write_run_outputs
+
+    reader = SQLiteNormalizedReader(args.db)
+    run = run_replay(
+        reader,
+        end_time=args.end_time,
+        interval_seconds=args.interval,
+        embargo_seconds=args.embargo,
+        seed=args.seed,
+    )
+    if run.evaluation is None:
+        raise SystemExit(
+            "error: analysis produced no evaluation "
+            f"({'; '.join(run.notes) or 'insufficient labeled decisions'})"
+        )
+    paths = write_run_outputs(run, args.output)
+    audit_path = os.path.join(args.output, "audit_summary.json")
+    with open(audit_path, "w") as fh:
+        json.dump(audit_database(reader.conn), fh, indent=2)
+    paths["audit_summary"] = audit_path
+    print(f"run {run.run_id}: {len(run.labeled_episodes)} labeled decisions")
+    for model, metrics in run.evaluation.metrics.items():
+        print(
+            f"  {model}: log_loss={metrics['log_loss']:.4f} "
+            f"brier={metrics['brier']:.4f} acc={metrics['accuracy']:.3f}"
+        )
+    print(
+        "  M2->M3 log-loss improvement: "
+        f"{run.evaluation.improvements['m2_to_m3_log_loss']:+.4f}"
+    )
+    for name, path in paths.items():
+        print(f"  wrote {name}: {path}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="polymarket.cli",
+        description="Polymarket research pipeline (read-only; no trading)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init-db", help="create schema in a new or existing db")
+    p.add_argument("--db", required=True)
+    p.set_defaults(func=cmd_init_db)
+
+    p = sub.add_parser("collect", help="collect live data (network required)")
+    p.add_argument("--db", required=True)
+    p.add_argument("--surface", required=True, choices=["trades"])
+    p.add_argument("--condition-id")
+    p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("normalize", help="normalize all stored raw responses")
+    p.add_argument("--db", required=True)
+    p.set_defaults(func=cmd_normalize)
+
+    p = sub.add_parser("build-synthetic", help="build the synthetic fixture db")
+    p.add_argument("--db", required=True)
+    p.add_argument("--overwrite", action="store_true")
+    p.set_defaults(func=cmd_build_synthetic)
+
+    p = sub.add_parser("audit", help="audit a database")
+    p.add_argument("--db", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("run-analysis", help="replay decisions and fit models")
+    p.add_argument("--db", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--end-time", type=float, default=None)
+    p.add_argument("--interval", type=float, default=3600.0)
+    p.add_argument("--embargo", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=1337)
+    p.set_defaults(func=cmd_run_analysis)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
