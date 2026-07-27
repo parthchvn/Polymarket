@@ -29,13 +29,33 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-RELEVANT_CLASSES = ("supports_positive", "supports_negative", "direct")
+RELEVANT_CLASSES = ("supports_positive", "supports_negative")
 
 
 @dataclass(frozen=True)
 class DecompositionConfig:
+    """The pinned news-sample contract, recorded with every analysis.
+
+    A claim qualifies as news for a market only when ALL hold:
+
+    * its LATEST relevance judgment per (claim, market) — under the
+      approved method/model when pinned, otherwise across methods —
+      has ``rel_class`` in ``relevant_classes`` with ``rel_score >=
+      min_rel_score``;
+    * that judgment's contract version equals the version ACTIVE at
+      the claim's arrival (semantics judged against the contract the
+      trader saw);
+    * the claim entered its family with ``edge_type = 'new'``
+      (novelty: duplicates and confirmations are excluded by default —
+      change ``novel_edge_types`` to broaden explicitly).
+    """
+
     bin_seconds: float = 900.0
     relevant_classes: tuple[str, ...] = RELEVANT_CLASSES
+    min_rel_score: float = 0.5
+    relevance_method: str | None = None       # pin e.g. 'ollama_llm'
+    relevance_model_version: str | None = None
+    novel_edge_types: tuple[str, ...] = ("new",)
     screen_basis: str = "retrospective_smoothed"
     mode_run_id: str | None = None
 
@@ -76,43 +96,97 @@ def _close_series(
     return out
 
 
-def _news_arrivals(
-    conn: sqlite3.Connection, config: DecompositionConfig, spec: str
+def _qualified_relevant_claims(
+    conn: sqlite3.Connection, config: DecompositionConfig
 ) -> dict[str, list[tuple[float, str]]]:
-    """condition -> [(arrival_time, claim_id)] under the spec."""
-    if spec == "all_relevant":
-        placeholders = ",".join("?" for _ in config.relevant_classes)
-        rows = conn.execute(
-            f"""
-            SELECT DISTINCT m.condition_id,
-                   c.first_available_at AS ts, c.claim_id
-            FROM relevance_judgments r
-            JOIN news_claims c ON c.claim_id = r.claim_id
-            JOIN markets m ON m.market_id = r.market_id
-            WHERE r.rel_class IN ({placeholders})
-            """,
-            config.relevant_classes,
-        ).fetchall()
-    elif spec == "screened_impactful":
-        if config.mode_run_id is None:
-            return {}
-        rows = conn.execute(
-            """
-            SELECT DISTINCT condition_id, news_time AS ts, claim_id
-            FROM news_impact_screens
-            WHERE mode_run_id = ? AND assignment_basis = ?
-              AND screen_status = 'screened' AND transition_detected = 1
-            """,
-            (config.mode_run_id, config.screen_basis),
-        ).fetchall()
-    else:
-        raise ValueError(f"unknown decomposition spec: {spec}")
+    """condition -> [(arrival, claim)] under the pinned contract."""
+    method_clause, args = "", []
+    if config.relevance_method:
+        method_clause += " AND r.method = ?"
+        args.append(config.relevance_method)
+    if config.relevance_model_version:
+        method_clause += " AND r.model_version = ?"
+        args.append(config.relevance_model_version)
+    edge_placeholders = ",".join("?" for _ in config.novel_edge_types)
+    rows = conn.execute(
+        f"""
+        SELECT m.condition_id, c.first_available_at AS ts, c.claim_id,
+               r.rel_class, r.rel_score, r.contract_version_seq,
+               r.computed_at, r.market_id
+        FROM relevance_judgments r
+        JOIN news_claims c ON c.claim_id = r.claim_id
+        JOIN claim_edges e ON e.claim_id = c.claim_id
+        JOIN markets m ON m.market_id = r.market_id
+        WHERE e.edge_type IN ({edge_placeholders}){method_clause}
+        ORDER BY c.claim_id, r.market_id, r.computed_at
+        """,
+        (*config.novel_edge_types, *args),
+    ).fetchall()
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for row in rows:                       # last write wins = latest
+        latest[(row["claim_id"], row["market_id"])] = row
+    active_version: dict[tuple[str, float], int | None] = {}
+
+    def version_at(market_id: str, ts: float) -> int | None:
+        key = (market_id, ts)
+        if key not in active_version:
+            found = conn.execute(
+                "SELECT version_seq FROM contract_versions WHERE "
+                "market_id = ? AND effective_from <= ? "
+                "ORDER BY effective_from DESC LIMIT 1",
+                (market_id, ts),
+            ).fetchone()
+            active_version[key] = found[0] if found else None
+        return active_version[key]
+
     out: dict[str, list[tuple[float, str]]] = {}
-    for row in rows:
+    for row in latest.values():
+        if row["rel_class"] not in config.relevant_classes:
+            continue
+        if (row["rel_score"] or 0.0) < config.min_rel_score:
+            continue
+        if row["contract_version_seq"] != version_at(
+            row["market_id"], float(row["ts"])
+        ):
+            continue                       # judged against a stale text
         out.setdefault(row["condition_id"], []).append(
             (float(row["ts"]), row["claim_id"])
         )
     return out
+
+
+def _news_arrivals(
+    conn: sqlite3.Connection, config: DecompositionConfig, spec: str
+) -> dict[str, list[tuple[float, str]]]:
+    """condition -> [(arrival_time, claim_id)] under the spec."""
+    relevant = _qualified_relevant_claims(conn, config)
+    if spec == "all_relevant":
+        return relevant
+    if spec == "screened_impactful":
+        # impact AND semantic relevance: a background claim near a
+        # liquidity transition is not news for this market
+        if config.mode_run_id is None:
+            return {}
+        impactful = {
+            (row["condition_id"], row["claim_id"])
+            for row in conn.execute(
+                """
+                SELECT condition_id, claim_id FROM news_impact_screens
+                WHERE mode_run_id = ? AND assignment_basis = ?
+                  AND screen_status = 'screened'
+                  AND transition_detected = 1
+                """,
+                (config.mode_run_id, config.screen_basis),
+            )
+        }
+        return {
+            condition: [
+                (ts, claim) for ts, claim in claims
+                if (condition, claim) in impactful
+            ]
+            for condition, claims in relevant.items()
+        }
+    raise ValueError(f"unknown decomposition spec: {spec}")
 
 
 def build_interval_records(

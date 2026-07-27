@@ -250,7 +250,7 @@ def cmd_underreaction(args) -> int:
     import os as _os
 
     from polymarket.analysis.attention import (
-        distraction_interaction_regression,
+        distraction_interaction_regressions,
     )
     from polymarket.analysis.news_returns import (
         DecompositionConfig,
@@ -281,15 +281,41 @@ def cmd_underreaction(args) -> int:
         regressions = run_drift_regressions(
             conn, config, spec, records=records
         )
-        placebo = run_drift_regressions(
-            conn, config, spec, records=records, placebo_seed=1337
-        )
+        # placebo distribution over many permutations -> empirical p
+        placebo_betas: dict[float, list[float]] = {}
+        for seed in range(args.placebo_seeds):
+            for result in run_drift_regressions(
+                conn, config, spec, records=records,
+                placebo_seed=10_000 + seed,
+            ):
+                placebo_betas.setdefault(
+                    result.horizon_seconds, []
+                ).append(result.beta_news)
+        placebo_summary = {}
+        for result in regressions:
+            draws = placebo_betas.get(result.horizon_seconds, [])
+            if draws:
+                exceed = sum(
+                    1 for b in draws if abs(b) >= abs(result.beta_news)
+                )
+                placebo_summary[str(result.horizon_seconds)] = {
+                    "n_placebos": len(draws),
+                    "mean_beta": sum(draws) / len(draws),
+                    "empirical_p_news": (exceed + 1) / (len(draws) + 1),
+                }
+        # COMPLETE daily table as its own artifact
+        daily = daily_aggregation(records)
+        with open(
+            _os.path.join(args.output, f"daily_{spec}.json"), "w"
+        ) as handle:
+            _json.dump(daily, handle, indent=2, sort_keys=True)
         report["specs"][spec] = {
             "intervals": len(records),
             "news_intervals": news_n,
-            "daily": daily_aggregation(records)[:50],
+            "daily_rows": len(daily),
+            "daily_file": f"daily_{spec}.json",
             "drift_regressions": [r.as_dict() for r in regressions],
-            "placebo_regressions": [r.as_dict() for r in placebo],
+            "placebo": placebo_summary,
         }
         events = event_absorption(conn, config, spec)
         with open(
@@ -298,10 +324,13 @@ def cmd_underreaction(args) -> int:
             for event in events:
                 handle.write(_json.dumps(event, sort_keys=True) + "\n")
         report["specs"][spec]["events"] = len(events)
-        interaction = distraction_interaction_regression(
+        report["specs"][spec]["events_with_intervening_news"] = sum(
+            1 for e in events if e["intervening_news"]
+        )
+        interactions = distraction_interaction_regressions(
             conn, config, spec, mode_run_id=args.mode_run_id
         )
-        report["specs"][spec]["distraction_interaction"] = interaction
+        report["specs"][spec]["distraction_interactions"] = interactions
     report["analyst_revision_mechanism"] = (
         "UNTESTED: requires an external expectations series the "
         "pipeline does not have"
@@ -571,6 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "event-mode prevalence proxy")
     p.add_argument("--screen-basis", default="retrospective_smoothed",
                    choices=["retrospective_smoothed", "online_filtered"])
+    p.add_argument("--placebo-seeds", type=int, default=20)
     p.set_defaults(func=cmd_underreaction)
 
     p = sub.add_parser(

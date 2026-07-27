@@ -13,7 +13,7 @@ import pytest
 
 from polymarket.analysis.attention import (
     compute_distraction,
-    distraction_interaction_regression,
+    distraction_interaction_regressions,
 )
 from polymarket.analysis.news_returns import (
     DecompositionConfig,
@@ -65,6 +65,14 @@ def _claim(conn, claim_id, ts, condition_id=COND, market_id=None,
         "parser_version, schema_version, normalized_at) VALUES "
         "(?, ?, 'Q?', 1, 0, 'h', 'p', 2, ?)",
         (market_id, condition_id, now),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO contract_versions (market_id, "
+        "version_seq, effective_from, first_observed_at, question, "
+        "rules_text, content_hash, raw_response_id, parser_version, "
+        "schema_version, normalized_at) VALUES (?, 1, 0, 0, 'Q?', "
+        "'rules', ?, 1, 'p', 2, ?)",
+        (market_id, f"ch-{market_id}", now),
     )
     conn.execute(
         "INSERT OR IGNORE INTO news_articles (article_id, source_id, "
@@ -256,12 +264,17 @@ def test_distraction_interaction_positive_when_planted(conn):
         level += rng.gauss(0, 0.001)
         _bar(conn, COND, T0 + i * BIN, level)
     conn.commit()
-    out = distraction_interaction_regression(
+    out = distraction_interaction_regressions(
         conn, CONFIG, horizon=4 * BIN
     )
     assert out is not None
-    assert out["beta_news_x_distraction"] > 0
-    assert out["n"] > 300
+    claims = out["proxies"]["cross_market_claim_count"]
+    assert claims["beta_news_x_proxy"] > 0        # planted mechanism
+    assert claims["n"] > 300
+    # each proxy is its own regression; no composite index exists
+    assert "unrelated_family_count" in out["proxies"]
+    assert "weekend" in out["proxies"]
+    assert "ANALOGUES" in out["prediction"]
 
 
 def test_compute_distraction_proxies(conn):
@@ -341,3 +354,194 @@ def test_clustered_se_sanity():
         "pair": pair, "iid": np.arange(2 * n),
     })
     assert dup["se"]["pair"][1] > dup["se"]["iid"][1] * 1.2
+
+
+def _status(conn, market_id, effective_from, *, resolved=0, closed=0,
+            enabled=1):
+    conn.execute(
+        "INSERT INTO market_status_versions (market_id, "
+        "effective_from, first_observed_at, trading_enabled, closed, "
+        "resolved, raw_response_id, parser_version, schema_version, "
+        "normalized_at) VALUES (?, ?, ?, ?, ?, ?, 1, 'p', 2, 1)",
+        (market_id, effective_from, effective_from, enabled, closed,
+         resolved),
+    )
+
+
+def test_resolution_censors_horizon_windows(conn):
+    """Observations whose horizon window crosses a resolution are
+    censored — mechanical convergence is not continuation."""
+    _continuation_world(conn, n=120)
+    _status(conn, f"m-{COND}", T0 + 80 * BIN, resolved=1)
+    conn.commit()
+    results = run_drift_regressions(conn, CONFIG, horizons=(4 * BIN,))
+    assert results and results[0].censored > 0
+    # and a resolved-out claim's event window is not coverage-complete
+    events = event_absorption(conn, CONFIG, drift_horizon=10 * BIN)
+    late = [
+        e for e in events
+        if e["news_time"] > T0 + 75 * BIN and not e[
+            "market_open_through_window"]
+    ]
+    assert late and all(not e["coverage_complete"] for e in late)
+
+
+def test_stale_future_endpoint_is_dropped_not_zero(conn):
+    """A series that stops before t+h must DROP the observation; the
+    old close_asof would have returned the base close and manufactured
+    an exact-zero future return."""
+    for i in range(30):
+        _bar(conn, COND, T0 + i * BIN, 0.01 * i)
+    _claim(conn, "edge-news", T0 + 28 * BIN + 30)
+    conn.commit()
+    results = run_drift_regressions(
+        conn, CONFIG, horizons=(10 * BIN,)
+    )
+    assert results and results[0].stale_endpoint_dropped > 0
+    from polymarket.analysis.underreaction import CloseSeries
+
+    closes = CloseSeries(conn, BIN)
+    # near-target lookup refuses the stale close outright
+    assert closes.close_near_target(
+        COND, T0 + 40 * BIN, after=T0 + 30 * BIN
+    ) is None
+    # and never returns the base itself
+    found = closes.close_near_target(COND, T0 + 10 * BIN,
+                                     after=T0 + 10 * BIN)
+    assert found is None or found[0] > T0 + 10 * BIN
+
+
+def test_pinned_news_sample_contract(conn):
+    for i in range(10):
+        _bar(conn, COND, T0 + i * BIN, 0.01 * i)
+    _claim(conn, "good", T0 + 2 * BIN + 10)                # qualifies
+    _claim(conn, "weak", T0 + 3 * BIN + 10)                # low score
+    conn.execute(
+        "UPDATE relevance_judgments SET rel_score = 0.2 "
+        "WHERE claim_id = 'weak'"
+    )
+    _claim(conn, "background", T0 + 4 * BIN + 10,
+           rel_class="background")                          # class out
+    _claim(conn, "dup", T0 + 5 * BIN + 10)
+    conn.execute(
+        "UPDATE claim_edges SET edge_type = 'duplicate' "
+        "WHERE claim_id = 'dup'"
+    )                                                       # not novel
+    _claim(conn, "stale-version", T0 + 6 * BIN + 10)
+    conn.execute(
+        "UPDATE relevance_judgments SET contract_version_seq = 7 "
+        "WHERE claim_id = 'stale-version'"
+    )                                                       # wrong text
+    conn.commit()
+    records = build_interval_records(conn, CONFIG)
+    labelled = {
+        claim for r in records for claim in r.news_claims
+    }
+    assert labelled == {"good"}
+    # pinning to a method excludes judgments from other scorers
+    conn.execute(
+        "UPDATE relevance_judgments SET method = 'other' "
+        "WHERE claim_id = 'good'"
+    )
+    conn.commit()
+    pinned = DecompositionConfig(
+        bin_seconds=BIN, relevance_method="rule",
+    )
+    records = build_interval_records(conn, pinned)
+    assert not any(r.news_claims for r in records)
+
+
+def test_latest_judgment_per_claim_wins(conn):
+    for i in range(10):
+        _bar(conn, COND, T0 + i * BIN, 0.01 * i)
+    _claim(conn, "flip", T0 + 2 * BIN + 10)                # relevant v1
+    now = time.time()
+    conn.execute(
+        "INSERT INTO relevance_judgments (relevance_judgment_id, "
+        "claim_id, event_family_id, market_id, contract_version_seq, "
+        "source_effective_at, scored_at, computed_at, rel_class, "
+        "rel_score, direction, method, model_version) VALUES "
+        "('rj-flip-2', 'flip', 'fam-flip', ?, 1, ?, ?, ?, "
+        "'irrelevant', 0.9, 0.0, 'rule', 'v2')",
+        (f"m-{COND}", T0 + 2 * BIN + 10, now,
+         T0 + 2 * BIN + 11),                # LATER judgment: irrelevant
+    )
+    conn.commit()
+    records = build_interval_records(conn, CONFIG)
+    assert not any(r.news_claims for r in records)  # latest wins
+
+
+def test_small_market_count_refuses_t_statistics(conn):
+    _continuation_world(conn)                # a single market
+    result = run_drift_regressions(conn, CONFIG, horizons=(BIN,))[0]
+    assert result.cluster_counts["market"] == 1
+    assert result.inference_admissible is False
+    payload = result.as_dict()
+    assert payload["t_news"] is None
+    assert "refused" in payload["inference_note"]
+    assert payload["wild_cluster_p_news"] is not None
+    assert "two_way" in payload["se_news"]   # two-way SEs still shown
+
+
+def test_block_bootstrap_reports_or_skips_honestly(conn):
+    _continuation_world(conn)
+    short = run_drift_regressions(conn, CONFIG, horizons=(BIN,))[0]
+    assert short.block_bootstrap is not None
+    if "se" in short.block_bootstrap:
+        assert short.block_bootstrap["se"] > 0
+    else:
+        assert "skipped" in short.block_bootstrap
+
+
+def test_distraction_own_families_asof(conn):
+    """A family judged relevant only LATER must count as unrelated at
+    earlier intervals — the classification cannot leak backward."""
+    _bar(conn, COND, T0 + BIN, 0.0)
+    _bar(conn, COND, T0 + 2 * BIN, 0.01)
+    _claim(conn, "late-own", T0 + 100.0)
+    conn.execute(
+        "UPDATE relevance_judgments SET computed_at = ? "
+        "WHERE claim_id = 'late-own'", (T0 + 10 * BIN,),
+    )
+    conn.commit()
+    records = build_interval_records(conn, CONFIG)
+    proxies = compute_distraction(conn, records)
+    # at interval T0+2*BIN the relevant judgment (computed later) must
+    # not yet remove the family from the unrelated set
+    assert proxies[0]["unrelated_family_count"] == 1
+
+
+def test_intervening_news_flagged(conn):
+    for i in range(30):
+        _bar(conn, COND, T0 + i * BIN, 0.005 * i)
+    _claim(conn, "first", T0 + 5 * BIN + 10)
+    _claim(conn, "second", T0 + 7 * BIN + 10)
+    conn.commit()
+    events = event_absorption(conn, CONFIG, drift_horizon=6 * BIN)
+    by_claim = {e["claim_id"]: e for e in events}
+    assert by_claim["first"]["intervening_news"] is True
+    assert by_claim["second"]["intervening_news"] is False
+
+
+def test_availability_mode_persisted(tmp_path):
+    import sys
+    sys.path.insert(0, 'tests/analysis')
+    import test_liquidity_modes as modes_t
+    from polymarket.analysis.liquidity_modes import (
+        JumpModelConfig,
+        fit_jump_model,
+        persist_jump_model,
+    )
+    conn = init_db(str(tmp_path / "avail.sqlite"), description="t")
+    modes_t._regime_world(conn)
+    model = fit_jump_model(
+        conn, fit_cutoff=modes_t.T0 + 60 * modes_t.BIN,
+        config=JumpModelConfig(fixed_lambda=1.0),
+    )
+    persist_jump_model(conn, model, modes_t.T0 + 60 * modes_t.BIN)
+    row = conn.execute(
+        "SELECT availability_mode, model_deployed_at FROM "
+        "liquidity_mode_runs"
+    ).fetchone()
+    assert row[0] == "reconstructed_prequential"   # honest default
+    assert row[1] is None

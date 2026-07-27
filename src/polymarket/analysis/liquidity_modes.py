@@ -519,21 +519,34 @@ def fit_jump_model(
 
 
 def persist_jump_model(
-    conn: sqlite3.Connection, model: FittedJumpModel, fit_cutoff: float
+    conn: sqlite3.Connection, model: FittedJumpModel, fit_cutoff: float,
+    *,
+    availability_mode: str = "reconstructed_prequential",
+    model_deployed_at: float | None = None,
 ) -> None:
+    """``fit_cutoff`` is the TRAINING cutoff (no post-cutoff bars in
+    the fit).  ``availability_mode`` states what the run may claim:
+    'live_deployed' (the model existed and ran at
+    ``model_deployed_at``), 'reconstructed_prequential' (fit today
+    with a historical cutoff — the honest default for backtests), or
+    'retrospective'.  Screens inherit the discipline: online screens
+    prove no post-news TRAINING data, not historical deployment,
+    unless the run is live_deployed."""
     now = time.time()
     conn.execute(
         """
         INSERT OR REPLACE INTO liquidity_mode_runs
             (mode_run_id, fit_cutoff, bin_seconds, lambda_penalty,
-             lambda_selection, centroids_json, reference_stats_json,
+             lambda_selection, model_deployed_at, availability_mode,
+             centroids_json, reference_stats_json,
              calm_mode, train_bar_count, config_json, model_version,
              created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             model.mode_run_id, fit_cutoff, model.config.bin_seconds,
             model.lambda_penalty, model.lambda_selection,
+            model_deployed_at, availability_mode,
             canonical_json(model.centroids),
             canonical_json(model.reference_stats), model.calm_mode,
             model.train_bar_count,
