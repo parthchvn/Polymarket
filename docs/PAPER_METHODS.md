@@ -140,12 +140,46 @@ permutations run many seeds and report an empirical p-value.
 Distraction proxies use only classifications available as of each
 interval.
 
-**Availability wording:** mode runs record ``availability_mode``
-('reconstructed_prequential' by default — fit today with a historical
-training cutoff; 'live_deployed' only with a real
-``model_deployed_at``).  Online screens therefore prove the absence of
-post-news TRAINING data, not historical deployment, unless the run is
-live-deployed.
+**Availability wording — now ENFORCED:** mode runs record
+``availability_mode`` ('reconstructed_prequential' by default — fit
+today with a historical training cutoff; 'live_deployed' only with a
+real ``model_deployed_at``, settable via
+``fit-liquidity-modes --availability-mode --model-deployed-at``).  The
+screen applies the mode: prequential runs gate online screens at the
+training cutoff (proving only the absence of post-news training data),
+while live-deployed runs gate at the DEPLOYMENT time — news between
+cutoff and deployment is ``model_unavailable`` — and a live-deployed
+run without a deployment timestamp is refused outright.  The per-row
+``model_effective_from`` records the threshold actually applied.
+
+**Attention availability:** the own-family exclusion in the
+distraction proxies takes a policy: ``online_scored`` keys on when the
+scorer actually RAN (a backdated LLM rescore did not exist
+historically), ``retrospective_source`` (the paper-analysis default,
+recorded in the report) keys on text availability.  ``computed_at``
+alone is never used, since rescoring deliberately backdates it.
+
+**Pinned analysis configuration:** ``underreaction-analysis`` exposes
+``--relevance-method``, ``--relevance-model-version``,
+``--min-rel-score`` and repeatable ``--novel-edge-type``, and writes
+the complete news-sample contract into
+``underreaction_report.json`` — including the deterministic judgment
+tie-break (latest ``computed_at``; ties by method, model version,
+judgment id).
+
+**Lifecycle censoring fails CLOSED:** a horizon window is admissible
+only when the market is positively known open — a non-blocking status
+in force at the start, no blocking status inside, an active contract
+version at the start, no recorded resolution before the endpoint, and
+no blocking collector gap overlapping the window (an outage means
+lifecycle changes could have been missed).  Unknown coverage is
+censored, not assumed open.
+
+**Cluster refusal is per dimension:** a t-statistic requires at least
+five clusters in ITS dimension; the two-way statistic requires both,
+i.e. min(markets, days) >= 5.  Deficient dimensions are named in the
+inference note, and the wild-cluster bootstrap runs on the smaller
+clustering.
 
 **Model-availability discipline (screens):** an online-basis screen
 additionally requires the mode model to have EXISTED before the news

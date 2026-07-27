@@ -605,3 +605,47 @@ def test_single_clear_boundary_is_partial_not_negative(conn):
     assert row["pre_mode_label"] is None            # truly one boundary
     assert (row["transition_detected"], row["screen_status"]) \
         == (1, "screened")
+
+
+def test_live_deployed_gates_at_deployment_time(conn):
+    """A live_deployed model screens online only from its deployment
+    time — news between the training cutoff and deployment was not
+    screened by a running model."""
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
+    cutoff = T0 + 60 * BIN
+    deployed = T0 + 150 * BIN
+    model = fit_jump_model(
+        conn, fit_cutoff=cutoff,
+        config=JumpModelConfig(fixed_lambda=1.0),
+    )
+    persist_jump_model(
+        conn, model, cutoff,
+        availability_mode="live_deployed", model_deployed_at=deployed,
+    )
+    _news_family(conn, "fam-gap", T0 + 100 * BIN + 42)   # cutoff<t<dep
+    counters = screen_news_impact(conn, model.mode_run_id)
+    assert counters["model_unavailable"] == 1
+    row = conn.execute(
+        "SELECT model_effective_from FROM news_impact_screens "
+        "WHERE assignment_basis = 'online_filtered'"
+    ).fetchone()
+    assert row[0] == deployed                 # the threshold APPLIED
+    # retrospective basis is exempt as ever
+    retro = screen_news_impact(
+        conn, model.mode_run_id,
+        assignment_basis="retrospective_smoothed",
+    )
+    assert retro["screened"] == 1
+
+
+def test_live_deployed_without_timestamp_refuses(conn):
+    _regime_world(conn, event_windows=((30, 40),))
+    model = _fitted(conn)
+    conn.execute(
+        "UPDATE liquidity_mode_runs SET availability_mode = "
+        "'live_deployed', model_deployed_at = NULL "
+        "WHERE mode_run_id = ?", (model.mode_run_id,),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="live_deployed"):
+        screen_news_impact(conn, model.mode_run_id)

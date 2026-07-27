@@ -266,15 +266,25 @@ def cmd_underreaction(args) -> int:
     conn = connect(args.db)
     ensure_paper_schema(conn)
     _os.makedirs(args.output, exist_ok=True)
+    if args.novel_edge_type is None:
+        args.novel_edge_type = ["new"]
     config = DecompositionConfig(
         bin_seconds=args.bin_seconds,
         mode_run_id=args.mode_run_id,
         screen_basis=args.screen_basis,
+        min_rel_score=args.min_rel_score,
+        relevance_method=args.relevance_method,
+        relevance_model_version=args.relevance_model_version,
+        novel_edge_types=tuple(args.novel_edge_type),
     )
     specs = ["all_relevant"]
     if args.mode_run_id:
         specs.append("screened_impactful")
-    report: dict = {"specs": {}}
+    report: dict = {
+        "news_sample_contract": config.as_dict(),
+        "attention_availability_policy": "retrospective_source",
+        "specs": {},
+    }
     for spec in specs:
         records = build_interval_records(conn, config, spec)
         news_n = sum(1 for r in records if r.is_news)
@@ -371,7 +381,16 @@ def cmd_fit_liquidity_modes(args) -> int:
         print(f"cannot fit: {exc}")
         conn.close()
         return 1
-    persist_jump_model(conn, model, fit_cutoff)
+    if (args.availability_mode == "live_deployed"
+            and args.model_deployed_at is None):
+        print("live_deployed requires --model-deployed-at")
+        conn.close()
+        return 1
+    persist_jump_model(
+        conn, model, fit_cutoff,
+        availability_mode=args.availability_mode,
+        model_deployed_at=args.model_deployed_at,
+    )
     labels = {}
     for (_, _), mode in model.assignments.items():
         label = "calm" if mode == model.calm_mode else "event"
@@ -601,6 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--screen-basis", default="retrospective_smoothed",
                    choices=["retrospective_smoothed", "online_filtered"])
     p.add_argument("--placebo-seeds", type=int, default=20)
+    p.add_argument("--relevance-method", default=None,
+                   help="pin the news sample to one scorer method")
+    p.add_argument("--relevance-model-version", default=None)
+    p.add_argument("--min-rel-score", type=float, default=0.5)
+    p.add_argument("--novel-edge-type", action="append",
+                   default=None,
+                   help="repeatable; default: new")
     p.set_defaults(func=cmd_underreaction)
 
     p = sub.add_parser(
@@ -614,6 +640,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: now)")
     p.add_argument("--fixed-lambda", type=float, default=None,
                    help="skip persistence-target selection")
+    p.add_argument("--availability-mode",
+                   default="reconstructed_prequential",
+                   choices=["reconstructed_prequential", "live_deployed",
+                            "retrospective"],
+                   help="what the run may claim; live_deployed gates "
+                        "online screens at --model-deployed-at instead "
+                        "of the training cutoff")
+    p.add_argument("--model-deployed-at", type=float, default=None)
     p.set_defaults(func=cmd_fit_liquidity_modes)
 
     p = sub.add_parser(

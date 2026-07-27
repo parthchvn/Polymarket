@@ -59,6 +59,22 @@ class DecompositionConfig:
     screen_basis: str = "retrospective_smoothed"
     mode_run_id: str | None = None
 
+    def as_dict(self) -> dict:
+        return {
+            "bin_seconds": self.bin_seconds,
+            "relevant_classes": list(self.relevant_classes),
+            "min_rel_score": self.min_rel_score,
+            "relevance_method": self.relevance_method,
+            "relevance_model_version": self.relevance_model_version,
+            "novel_edge_types": list(self.novel_edge_types),
+            "screen_basis": self.screen_basis,
+            "mode_run_id": self.mode_run_id,
+            "judgment_selection": (
+                "latest computed_at per (claim, market); ties broken "
+                "by (method, model_version, judgment_id)"
+            ),
+        }
+
 
 @dataclass
 class IntervalRecord:
@@ -112,18 +128,23 @@ def _qualified_relevant_claims(
         f"""
         SELECT m.condition_id, c.first_available_at AS ts, c.claim_id,
                r.rel_class, r.rel_score, r.contract_version_seq,
-               r.computed_at, r.market_id
+               r.computed_at, r.market_id, r.method, r.model_version,
+               r.relevance_judgment_id
         FROM relevance_judgments r
         JOIN news_claims c ON c.claim_id = r.claim_id
         JOIN claim_edges e ON e.claim_id = c.claim_id
         JOIN markets m ON m.market_id = r.market_id
         WHERE e.edge_type IN ({edge_placeholders}){method_clause}
-        ORDER BY c.claim_id, r.market_id, r.computed_at
+        ORDER BY c.claim_id, r.market_id, r.computed_at,
+                 r.method, r.model_version, r.relevance_judgment_id
         """,
         (*config.novel_edge_types, *args),
     ).fetchall()
+    # last write wins = latest computed_at; ties broken
+    # deterministically by (method, model_version, judgment_id) so the
+    # selected judgment is stable across runs and row orderings
     latest: dict[tuple[str, str], sqlite3.Row] = {}
-    for row in rows:                       # last write wins = latest
+    for row in rows:
         latest[(row["claim_id"], row["market_id"])] = row
     active_version: dict[tuple[str, float], int | None] = {}
 

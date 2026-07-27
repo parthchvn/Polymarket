@@ -75,6 +75,13 @@ def _claim(conn, claim_id, ts, condition_id=COND, market_id=None,
         (market_id, f"ch-{market_id}", now),
     )
     conn.execute(
+        "INSERT OR IGNORE INTO market_status_versions (market_id, "
+        "effective_from, first_observed_at, trading_enabled, closed, "
+        "resolved, raw_response_id, parser_version, schema_version, "
+        "normalized_at) VALUES (?, 0, 0, 1, 0, 0, 1, 'p', 2, ?)",
+        (market_id, now),
+    )
+    conn.execute(
         "INSERT OR IGNORE INTO news_articles (article_id, source_id, "
         "source_url, source_published_at, first_observed_at, "
         "download_completed_at, timestamp_source, timestamp_confidence, "
@@ -472,15 +479,44 @@ def test_latest_judgment_per_claim_wins(conn):
 
 
 def test_small_market_count_refuses_t_statistics(conn):
-    _continuation_world(conn)                # a single market
+    _continuation_world(conn)                # a single market, many days
     result = run_drift_regressions(conn, CONFIG, horizons=(BIN,))[0]
     assert result.cluster_counts["market"] == 1
+    assert result.cluster_counts["utc_day"] >= 5
     assert result.inference_admissible is False
     payload = result.as_dict()
-    assert payload["t_news"] is None
-    assert "refused" in payload["inference_note"]
+    # per-dimension refusal: market and two-way refused, day reported
+    assert payload["t_news"]["market"] is None
+    assert payload["t_news"]["two_way"] is None
+    assert payload["t_news"]["utc_day"] is not None
+    assert "market=1" in payload["inference_note"]
     assert payload["wild_cluster_p_news"] is not None
     assert "two_way" in payload["se_news"]   # two-way SEs still shown
+
+
+def test_small_day_count_refuses_day_and_two_way(conn):
+    """Six markets inside a single UTC day: many market clusters, ONE
+    day cluster — day and two-way t-statistics must be refused even
+    though markets alone would pass."""
+    for k in range(6):
+        cid = f"0xday{k}"
+        rng = random.Random(100 + k)
+        level = 0.0
+        for i in range(40):                  # 40 bins ~ 10h: one day
+            if i > 0 and i % 10 == 0:
+                _claim(conn, f"{cid}-n{i}", T0 + i * BIN + 30.0, cid)
+                level += rng.uniform(0.02, 0.08)
+            level += rng.gauss(0, 0.002)
+            _bar(conn, cid, T0 + i * BIN, level)
+    conn.commit()
+    result = run_drift_regressions(conn, CONFIG, horizons=(BIN,))[0]
+    assert result.cluster_counts["market"] == 6
+    assert result.cluster_counts["utc_day"] < 5
+    payload = result.as_dict()
+    assert payload["t_news"]["market"] is not None
+    assert payload["t_news"]["utc_day"] is None
+    assert payload["t_news"]["two_way"] is None
+    assert "utc_day=" in payload["inference_note"]
 
 
 def test_block_bootstrap_reports_or_skips_honestly(conn):
@@ -493,22 +529,37 @@ def test_block_bootstrap_reports_or_skips_honestly(conn):
         assert "skipped" in short.block_bootstrap
 
 
-def test_distraction_own_families_asof(conn):
-    """A family judged relevant only LATER must count as unrelated at
-    earlier intervals — the classification cannot leak backward."""
+def test_distraction_availability_policies(conn):
+    """A relevance classification whose SCORER ran late (backfilled
+    LLM) must not leak backward under the online policy, while the
+    retrospective policy keys on text availability — and backdated
+    computed_at must fool neither."""
     _bar(conn, COND, T0 + BIN, 0.0)
     _bar(conn, COND, T0 + 2 * BIN, 0.01)
     _claim(conn, "late-own", T0 + 100.0)
     conn.execute(
-        "UPDATE relevance_judgments SET computed_at = ? "
-        "WHERE claim_id = 'late-own'", (T0 + 10 * BIN,),
+        "UPDATE relevance_judgments SET scored_at = ?, "
+        "source_effective_at = ?, computed_at = ? "
+        "WHERE claim_id = 'late-own'",
+        (T0 + 10 * BIN,      # scorer actually ran much later
+         T0 + 100.0,         # text was available early
+         T0 + 101.0),        # rescore-style backdated as-of key
     )
     conn.commit()
     records = build_interval_records(conn, CONFIG)
-    proxies = compute_distraction(conn, records)
-    # at interval T0+2*BIN the relevant judgment (computed later) must
-    # not yet remove the family from the unrelated set
-    assert proxies[0]["unrelated_family_count"] == 1
+    online = compute_distraction(
+        conn, records, availability_policy="online_scored"
+    )
+    retro = compute_distraction(
+        conn, records, availability_policy="retrospective_source"
+    )
+    # online: the classification did not exist yet -> still unrelated
+    assert online[0]["unrelated_family_count"] == 1
+    # retrospective: text-availability keying -> own family already
+    assert retro[0]["unrelated_family_count"] == 0
+    with pytest.raises(ValueError):
+        compute_distraction(conn, records,
+                            availability_policy="whenever")
 
 
 def test_intervening_news_flagged(conn):
@@ -527,6 +578,7 @@ def test_availability_mode_persisted(tmp_path):
     import sys
     sys.path.insert(0, 'tests/analysis')
     import test_liquidity_modes as modes_t
+
     from polymarket.analysis.liquidity_modes import (
         JumpModelConfig,
         fit_jump_model,
@@ -545,3 +597,37 @@ def test_availability_mode_persisted(tmp_path):
     ).fetchone()
     assert row[0] == "reconstructed_prequential"   # honest default
     assert row[1] is None
+
+
+
+def test_unknown_lifecycle_fails_closed(conn):
+    """Bars without any status/contract history must be censored, not
+    silently treated as certified open — and a blocking collector gap
+    over the window censors too."""
+    from polymarket.analysis.underreaction import MarketCensor
+
+    for i in range(30):
+        _bar(conn, "0xnostatus", T0 + i * BIN, 0.01 * i)
+    conn.commit()
+    censor = MarketCensor(conn)
+    assert censor.open_through(
+        "0xnostatus", T0 + 5 * BIN, T0 + 10 * BIN
+    ) is False                                # no lifecycle knowledge
+    # a properly documented market is admissible ...
+    _claim(conn, "docs", T0 + 2 * BIN + 5)    # inserts status+contract
+    conn.commit()
+    censor = MarketCensor(conn)
+    assert censor.open_through(COND, T0 + BIN, T0 + 5 * BIN) is True
+    # ... unless a blocking collector gap overlaps the window
+    conn.execute(
+        "INSERT INTO collector_gaps (collector, surface, object_id, "
+        "gap_start, gap_end, reason, detected_at) VALUES "
+        "('forward-loop', 'books', ?, ?, ?, 'downtime', 1)",
+        (COND, T0 + 2 * BIN, T0 + 3 * BIN),
+    )
+    conn.commit()
+    censor = MarketCensor(conn)
+    assert censor.open_through(COND, T0 + BIN, T0 + 5 * BIN) is False
+    assert censor.open_through(
+        COND, T0 + 4 * BIN, T0 + 6 * BIN
+    ) is True                                 # window past the gap

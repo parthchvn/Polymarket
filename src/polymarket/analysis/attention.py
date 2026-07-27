@@ -64,18 +64,35 @@ def _family_times(
 
 
 def _own_family_events(
-    conn: sqlite3.Connection, relevant_classes: tuple[str, ...]
+    conn: sqlite3.Connection, relevant_classes: tuple[str, ...],
+    availability_policy: str = "retrospective_source",
 ) -> dict[str, list[tuple[float, str]]]:
     """condition -> [(available_at, family)] for RELEVANTLY judged
-    families, sorted by availability — so the historical "own" set at
-    time t contains only families whose relevant judgment's underlying
-    text was available by t (no future classifications leak into the
-    proxy)."""
+    families, sorted by when the classification became available under
+    the policy:
+
+    * ``online_scored``: when the scorer actually RAN
+      (``scored_at``) — a backdated LLM rescore did not exist
+      historically, so online proxies must not use it earlier;
+    * ``retrospective_source`` (default for the paper analysis): when
+      the underlying text was available (``source_effective_at``) —
+      for labelled retrospective runs with frozen scorers.
+
+    Legacy rows fall back to ``computed_at`` for whichever field is
+    NULL."""
+    if availability_policy == "online_scored":
+        time_expr = "COALESCE(r.scored_at, r.computed_at)"
+    elif availability_policy == "retrospective_source":
+        time_expr = "COALESCE(r.source_effective_at, r.computed_at)"
+    else:
+        raise ValueError(
+            f"unknown availability policy: {availability_policy}"
+        )
     placeholders = ",".join("?" for _ in relevant_classes)
     out: dict[str, list[tuple[float, str]]] = {}
     for row in conn.execute(
         f"SELECT m.condition_id, r.event_family_id, "
-        f"MIN(r.computed_at) AS available_at "
+        f"MIN({time_expr}) AS available_at "
         f"FROM relevance_judgments r "
         f"JOIN markets m ON m.market_id = r.market_id "
         f"WHERE r.rel_class IN ({placeholders}) "
@@ -100,6 +117,7 @@ def compute_distraction(
     conn: sqlite3.Connection,
     records: list[IntervalRecord],
     mode_run_id: str | None = None,
+    availability_policy: str = "retrospective_source",
 ) -> list[dict]:
     """One proxy row per interval record, order-aligned."""
     from bisect import bisect_left, bisect_right
@@ -109,7 +127,9 @@ def compute_distraction(
     claim_times = _claim_times(conn)
     family_rows = _family_times(conn)
     family_times = [row[0] for row in family_rows]
-    own_events = _own_family_events(conn, RELEVANT_CLASSES)
+    own_events = _own_family_events(
+        conn, RELEVANT_CLASSES, availability_policy
+    )
     labels = {}
     if mode_run_id is not None:
         for row in conn.execute(
@@ -166,6 +186,7 @@ def distraction_interaction_regressions(
     spec: str = "all_relevant",
     horizon: float = 24 * 3600.0,
     mode_run_id: str | None = None,
+    availability_policy: str = "retrospective_source",
 ) -> dict | None:
     """ONE regression per standardized proxy (no composite index): the
     interaction r_news x proxy_z is reported for each mechanism
@@ -174,7 +195,9 @@ def distraction_interaction_regressions(
     from polymarket.analysis.underreaction import MarketCensor
 
     records = build_interval_records(conn, config, spec)
-    proxies = compute_distraction(conn, records, mode_run_id)
+    proxies = compute_distraction(
+        conn, records, mode_run_id, availability_policy
+    )
     closes = CloseSeries(conn, config.bin_seconds)
     censor = MarketCensor(conn)
     results: dict[str, dict] = {}
@@ -248,6 +271,7 @@ def distraction_interaction_regressions(
         return None
     return {
         "spec": spec,
+        "availability_policy": availability_policy,
         "prediction": "beta_news_x_proxy > 0 under the paper's "
                       "distraction mechanism (proxies are ANALOGUES "
                       "of the paper's attention measures, not direct "
