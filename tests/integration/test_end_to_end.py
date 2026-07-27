@@ -55,7 +55,7 @@ def test_full_workflow(synthetic_db_path, tmp_path):
     assert metrics["run_id"] == "test-run"
 
     audit = audit_database(reader.conn)
-    assert audit["schema_version"] == 1
+    assert audit["schema_version"] == 2
     assert audit["unknown_role_legs"] == 2
 
 

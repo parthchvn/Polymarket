@@ -19,7 +19,7 @@ def test_schema_version_recorded(db):
     row = db.execute(
         "SELECT schema_version, parser_version FROM schema_metadata"
     ).fetchone()
-    assert row["schema_version"] == SCHEMA_VERSION == 1
+    assert row["schema_version"] == SCHEMA_VERSION == 2
     assert row["parser_version"] == PARSER_VERSION
 
 

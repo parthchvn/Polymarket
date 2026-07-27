@@ -166,6 +166,52 @@ class SQLiteNormalizedReader:
 
     # ------------------------------------------------------------------
     # market state
+    def market_series_before(
+        self,
+        condition_id: str,
+        cutoff: float,
+        lookback: float,
+        policy: str = "book_preferred",
+    ) -> tuple[list[sqlite3.Row], str]:
+        """Canonical market price series with an EXPLICIT source policy.
+
+        Once execution-derived and book-mid state coexist, mixing them
+        into one series conflates midquotes with trade prints (bid-ask
+        bounce) and duplicates timestamps.  Policies:
+
+        * ``book_only``     — book-mid rows only (paper analyses);
+        * ``book_preferred``— book-mid when any exists in the window,
+          otherwise execution-derived, with the fallback reported;
+        * ``execution_only``— execution-derived rows only.
+
+        Returns (rows, source_used) where source_used is 'book_mid',
+        'derived' or 'none'.
+        """
+        def rows_for(source: str) -> list[sqlite3.Row]:
+            return self._conn.execute(
+                """
+                SELECT * FROM market_state
+                WHERE condition_id = ? AND ts < ? AND ts >= ?
+                  AND state_source = ?
+                ORDER BY ts
+                """,
+                (condition_id, cutoff, cutoff - lookback, source),
+            ).fetchall()
+
+        if policy == "book_only":
+            rows = rows_for("book_mid")
+            return rows, "book_mid" if rows else "none"
+        if policy == "execution_only":
+            rows = rows_for("executions")
+            return rows, "executions" if rows else "none"
+        if policy != "book_preferred":
+            raise ValueError(f"unknown market-series policy: {policy}")
+        rows = rows_for("book_mid")
+        if rows:
+            return rows, "book_mid"
+        rows = rows_for("executions")
+        return rows, "executions" if rows else "none"
+
     def market_state_before(
         self, condition_id: str, cutoff: float, lookback: float
     ) -> list[sqlite3.Row]:

@@ -65,9 +65,7 @@ def build_context(
         decision_time=t,
         contract=contract,
         market_status=status,
-        market_state=_rows(
-            reader.market_state_before(episode.condition_id, t, market_state_lookback)
-        ),
+        market_state=[],
         order_books=books,
         actor_history=_rows(reader.actor_trade_legs_before(t, actor=episode.actor_id)),
         position=reader.position_asof(episode.actor_id, episode.condition_id, t),
@@ -76,6 +74,12 @@ def build_context(
         relevance=[],
         coverage=dict(episode.coverage),
     )
+    series_rows, series_source = reader.market_series_before(
+        episode.condition_id, t, market_state_lookback,
+        policy="book_preferred",
+    )
+    context.market_state = _rows(series_rows)
+    context.coverage["market_series_source"] = series_source
     if episode.market_id and contract is not None:
         snapshot_rows, version_fallback = reader.relevance_snapshot_asof(
             episode.market_id, contract["version_seq"], t

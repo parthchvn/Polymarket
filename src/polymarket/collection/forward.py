@@ -50,14 +50,34 @@ DOWNTIME_FACTOR = 2.0  # gap recorded when idle > factor * interval
 
 @dataclass(frozen=True)
 class ForwardConfig:
+    """Per-surface cadences in SECONDS.
+
+    The screening paper needs five-minute liquidity bars built from
+    many within-bin book observations (average spread, average
+    best-level book size, within-bin volatility), so books sample much
+    faster than everything else.  The loop ticks at the fastest cadence
+    and each surface runs when due — trade calls are never repeated at
+    book frequency."""
+
     condition_ids: tuple[str, ...]
-    interval_seconds: float = 300.0
-    activity_every: int = 12       # cycles between activity refreshes
-    news_every: int = 12           # cycles between news refreshes
+    book_every: float = 60.0
+    trade_every: float = 300.0
+    market_every: float = 300.0
+    news_every_seconds: float = 300.0
+    activity_every_seconds: float = 3600.0
     activity_wallets: int = 30
     news_queries: tuple[str, ...] = ()
     trade_pages_per_cycle: int = 5
     activity_pages: int = 3
+
+    @property
+    def interval_seconds(self) -> float:
+        """The loop tick = the fastest configured cadence."""
+        cadences = [self.book_every, self.trade_every, self.market_every]
+        if self.news_queries:
+            cadences.append(self.news_every_seconds)
+        cadences.append(self.activity_every_seconds)
+        return max(1.0, min(cadences))
 
 
 @dataclass
@@ -66,6 +86,14 @@ class LoopState:
     last_cycle_start: float | None = None
     assets_by_condition: dict[str, list[str]] = field(default_factory=dict)
     failures: dict[str, int] = field(default_factory=dict)
+    last_run: dict[str, float] = field(default_factory=dict)
+
+    def due(self, surface: str, cadence: float, now: float) -> bool:
+        last = self.last_run.get(surface)
+        return last is None or now - last >= cadence - 1e-6
+
+    def mark(self, surface: str, now: float) -> None:
+        self.last_run[surface] = now
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +163,27 @@ def discover_assets(conn, condition_ids: tuple[str, ...]) -> dict[str, list[str]
     return assets
 
 
+def _wallets_from_raw_trades(conn, condition_ids, limit: int) -> list[str]:
+    import json
+    from collections import Counter
+
+    counts: Counter = Counter()
+    rows = conn.execute(
+        "SELECT payload FROM raw_responses WHERE collector = 'trades_taker' "
+        "ORDER BY raw_response_id DESC LIMIT 10"
+    ).fetchall()
+    wanted = set(condition_ids)
+    for (payload,) in rows:
+        try:
+            for record in json.loads(bytes(payload)):
+                if record.get("conditionId") in wanted:
+                    counts[record.get("proxyWallet")] += 1
+        except (ValueError, TypeError):
+            continue
+    counts.pop(None, None)
+    return [wallet for wallet, _ in counts.most_common(limit)]
+
+
 def top_taker_wallets(conn, condition_ids, limit: int) -> list[str]:
     placeholders = ",".join("?" for _ in condition_ids)
     rows = conn.execute(
@@ -166,13 +215,18 @@ def _observed(conn, collector: str, params: dict, fn: Callable, **kwargs):
 
 def surface_markets(conn, config: ForwardConfig, state: LoopState,
                     window: tuple[float, float]) -> str:
+    if not state.due("markets", config.market_every, window[1]):
+        return "(not due)"
     _observed(conn, "markets", {"condition_ids": list(config.condition_ids)},
               collect_markets, condition_ids=list(config.condition_ids))
+    state.mark("markets", window[1])
     return "markets ok"
 
 
 def surface_trades(conn, config: ForwardConfig, state: LoopState,
                    window: tuple[float, float]) -> str:
+    if not state.due("trades", config.trade_every, window[1]):
+        return "(not due)"
     cursor = derive_trade_cursor(conn)
     start_ts = (
         max(0.0, cursor - TRADE_OVERLAP_SECONDS)
@@ -191,11 +245,14 @@ def surface_trades(conn, config: ForwardConfig, state: LoopState,
                 max_pages=config.trade_pages_per_cycle,
             )
             total += getattr(outcome, "record_count", 0) or 0
+    state.mark("trades", window[1])
     return f"trades +{total}"
 
 
 def surface_books(conn, config: ForwardConfig, state: LoopState,
                   window: tuple[float, float]) -> str:
+    if not state.due("books", config.book_every, window[1]):
+        return "(not due)"
     if not state.assets_by_condition:
         state.assets_by_condition = discover_assets(
             conn, config.condition_ids
@@ -208,20 +265,28 @@ def surface_books(conn, config: ForwardConfig, state: LoopState,
             count += 1
     if count == 0:
         raise RuntimeError("no outcome tokens known yet for any market")
+    state.mark("books", window[1])
     return f"books x{count}"
 
 
 def surface_activity(conn, config: ForwardConfig, state: LoopState,
                      window: tuple[float, float]) -> str:
-    if state.cycle_index % max(1, config.activity_every) != 0:
-        return "activity (skipped)"
+    if not state.due("activity", config.activity_every_seconds, window[1]):
+        return "(not due)"
     wallets = top_taker_wallets(
         conn, config.condition_ids, config.activity_wallets
     )
+    if not wallets:
+        # fresh database: normalized legs do not exist yet, so derive
+        # wallets from the newest raw taker payload instead of skipping
+        wallets = _wallets_from_raw_trades(
+            conn, config.condition_ids, config.activity_wallets
+        )
     for wallet in wallets:
         _observed(conn, "activity", {"wallet": wallet},
                   collect_activity, wallet=wallet,
                   max_pages=config.activity_pages)
+    state.mark("activity", window[1])
     return f"activity x{len(wallets)}"
 
 
@@ -229,11 +294,12 @@ def surface_news(conn, config: ForwardConfig, state: LoopState,
                  window: tuple[float, float]) -> str:
     if not config.news_queries:
         return "news (none configured)"
-    if state.cycle_index % max(1, config.news_every) != 0:
-        return "news (skipped)"
+    if not state.due("news", config.news_every_seconds, window[1]):
+        return "(not due)"
     total = 0
     for query in config.news_queries:
         total += collect_google_news_rss(conn, query)
+    state.mark("news", window[1])
     return f"news +{total}"
 
 
