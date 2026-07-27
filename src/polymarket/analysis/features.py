@@ -253,8 +253,9 @@ def compute_features(
     else:
         f["mkt_last_price"] = 0.5
         f["mkt_last_price_missing"] = 1.0
-    f["mkt_volume"] = sum(s["volume"] or 0.0 for s in states)
-    f["mkt_execution_rate"] = len(states)
+    executions = context.execution_activity
+    f["mkt_volume"] = sum(e["size"] or 0.0 for e in executions)
+    f["mkt_execution_rate"] = float(len(executions))
     books = context.order_books
     spreads = [b["spread"] for b in books if b["spread"] is not None]
     if spreads:

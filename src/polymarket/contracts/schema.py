@@ -385,6 +385,9 @@ DDL: list[str] = [
         total_depth_mean REAL,
         imbalance_mean REAL,
         book_observation_count INTEGER NOT NULL DEFAULT 0,
+        expected_book_observation_count INTEGER,
+        book_coverage_fraction REAL,
+        blocking_gap INTEGER NOT NULL DEFAULT 0,
         execution_count INTEGER NOT NULL DEFAULT 0,
         coverage_complete INTEGER NOT NULL,
         feature_version TEXT NOT NULL,
@@ -418,9 +421,13 @@ DDL: list[str] = [
     """,
     """
     CREATE TABLE IF NOT EXISTS relevance_judgments (
+        relevance_judgment_id TEXT PRIMARY KEY,
+        claim_id TEXT,
         event_family_id TEXT NOT NULL,
         market_id TEXT NOT NULL,
         contract_version_seq INTEGER NOT NULL,
+        source_effective_at REAL,
+        scored_at REAL,
         computed_at REAL NOT NULL,
         rel_class TEXT NOT NULL CHECK (
             rel_class IN (
@@ -434,8 +441,7 @@ DDL: list[str] = [
         surprise REAL,
         method TEXT NOT NULL,
         model_version TEXT,
-        evidence_json TEXT,
-        PRIMARY KEY (event_family_id, market_id, contract_version_seq, computed_at)
+        evidence_json TEXT
     );
     """,
 ]
@@ -462,6 +468,7 @@ REQUIRED_TABLES = [
     "claim_edges",
     "relevance_judgments",
     "reasoning_judgments",
+    "liquidity_bars",
 ]
 
 LINEAGE_COLUMNS = ("raw_response_id", "parser_version", "schema_version", "normalized_at")
@@ -507,6 +514,11 @@ _PAPER_COLUMNS = {
         ("best_ask_size", "REAL"),
         ("tick_size", "REAL"),
     ),
+    "liquidity_bars": (
+        ("expected_book_observation_count", "INTEGER"),
+        ("book_coverage_fraction", "REAL"),
+        ("blocking_gap", "INTEGER NOT NULL DEFAULT 0"),
+    ),
 }
 
 
@@ -520,6 +532,8 @@ def ensure_paper_schema(conn: sqlite3.Connection) -> list[str]:
         existing = {
             row[1] for row in conn.execute(f"PRAGMA table_info({table})")
         }
+        if not existing:
+            continue  # table absent: created below with full columns
         for name, sql_type in columns:
             if name not in existing:
                 conn.execute(
@@ -534,5 +548,70 @@ def ensure_paper_schema(conn: sqlite3.Connection) -> list[str]:
             if "liquidity_bars" in statement:
                 conn.executescript(statement)
                 applied.append("liquidity_bars")
+    rj_columns = {
+        r[1] for r in conn.execute("PRAGMA table_info(relevance_judgments)")
+    }
+    if rj_columns and "relevance_judgment_id" not in rj_columns:
+        # legacy composite-PK table: rebuild under deterministic ids;
+        # legacy rows keep their values, id derived from identity fields
+        conn.execute(
+            "ALTER TABLE relevance_judgments "
+            "RENAME TO relevance_judgments_legacy"
+        )
+        for statement in DDL:
+            if "relevance_judgments" in statement and "legacy" not in statement:
+                conn.executescript(statement)
+        from polymarket.collection.canonical import namespace_id
+
+        rows = conn.execute(
+            "SELECT * FROM relevance_judgments_legacy"
+        ).fetchall()
+        names = [
+            d[0] for d in conn.execute(
+                "SELECT * FROM relevance_judgments_legacy LIMIT 0"
+            ).description
+        ]
+        for row in rows:
+            record = dict(zip(names, row))
+            judgment_id = namespace_id(
+                "relevance",
+                record["event_family_id"], record["market_id"],
+                record["contract_version_seq"], record["method"],
+                record.get("model_version"), record["computed_at"],
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO relevance_judgments
+                    (relevance_judgment_id, claim_id, event_family_id,
+                     market_id, contract_version_seq, source_effective_at,
+                     scored_at, computed_at, rel_class, rel_score,
+                     direction, novelty, surprise, method, model_version,
+                     evidence_json)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    judgment_id, record["event_family_id"],
+                    record["market_id"], record["contract_version_seq"],
+                    record["computed_at"], record["computed_at"],
+                    record["computed_at"], record["rel_class"],
+                    record["rel_score"], record["direction"],
+                    record.get("novelty"), record.get("surprise"),
+                    record["method"], record.get("model_version"),
+                    record.get("evidence_json"),
+                ),
+            )
+        conn.execute("DROP TABLE relevance_judgments_legacy")
+        applied.append("relevance_judgments:id_keyed")
+    if applied:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_metadata
+                (schema_version, applied_at, parser_version, description)
+            VALUES (?, ?, ?, ?)
+            """,
+            (SCHEMA_VERSION, time.time(), PARSER_VERSION,
+             "paper data contract migration: " + ", ".join(applied)),
+        )
+        applied.append(f"schema_metadata:v{SCHEMA_VERSION}")
     conn.commit()
     return applied

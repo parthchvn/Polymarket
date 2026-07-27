@@ -31,6 +31,11 @@ def feature_version_hash(extra: dict[str, Any] | None = None) -> str:
         "preprocessing": {
             "standardization": "training_only_zscore",
             "binary_suffixes_zero_preserving": ["_missing", "_incomplete"],
+            "market_sources": {
+                "prices": "market_series_policy:book_preferred",
+                "activity": "canonical_executions",
+                "books": "order_book_snapshots",
+            },
         },
     }
     if extra:

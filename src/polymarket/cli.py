@@ -245,6 +245,58 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_liquidity_bars(args) -> int:
+    from polymarket.analysis.liquidity_bars import (
+        LiquidityBarConfig,
+        build_liquidity_bars,
+    )
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    config = LiquidityBarConfig(bin_seconds=args.bin_seconds)
+    condition_ids = args.condition_id or [
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT condition_id FROM markets"
+        )
+    ]
+    for condition_id in condition_ids:
+        start = None
+        if not args.rebuild:
+            row = conn.execute(
+                "SELECT MAX(bin_start) FROM liquidity_bars "
+                "WHERE condition_id = ? AND bin_seconds = ?",
+                (condition_id, config.bin_seconds),
+            ).fetchone()
+            # recompute the last bar too: it may have been partial
+            start = row[0] if row and row[0] is not None else None
+        written = build_liquidity_bars(
+            conn, condition_id, start=start, config=config
+        )
+        stats = conn.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(coverage_complete),
+                   AVG(book_observation_count),
+                   AVG(book_coverage_fraction)
+            FROM liquidity_bars
+            WHERE condition_id = ? AND bin_seconds = ?
+            """,
+            (condition_id, config.bin_seconds),
+        ).fetchone()
+        total, complete, mean_obs, mean_cov = stats
+        complete = complete or 0
+        print(
+            f"{condition_id[:16]}…: wrote {written} bars | total "
+            f"{total} ({complete} complete, {total - complete} "
+            f"incomplete) | mean observations "
+            f"{(mean_obs or 0):.1f} | mean coverage "
+            f"{(mean_cov or 0):.2f}"
+        )
+    conn.close()
+    return 0
+
+
 def cmd_rescore_news(args) -> int:
     import json as _json
 
@@ -363,6 +415,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "build-liquidity-bars",
+        help="build five-minute liquidity bars (paper data contract)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--condition-id", action="append", default=None,
+                   help="repeatable; default: every market in the db")
+    p.add_argument("--bin-seconds", type=float, default=300.0)
+    p.add_argument("--rebuild", action="store_true",
+                   help="recompute all bars instead of incrementally")
+    p.set_defaults(func=cmd_build_liquidity_bars)
 
     p = sub.add_parser(
         "rescore-news",

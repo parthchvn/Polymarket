@@ -17,10 +17,17 @@ equities to bounded prediction-market prices:
 * **book size** (B): mean volume at the best bid and ask (the paper's
   definition), stored separately from mean TOTAL depth.
 
-Coverage honesty: ``coverage_complete`` requires at least one book
-observation inside the bin and no blocking collector gap overlapping
-it.  Bars with zero book observations still record execution turnover
-but carry NULL book statistics — missing data is not zero.
+Coverage honesty: bars form a REGULAR grid — every bin between start
+and end exists, including empty ones, because silently dropping missing
+intervals from the temporal sequence would bias the jump model's
+transition structure.  ``coverage_complete`` requires no blocking
+collector gap, at least ``min_book_observations`` book observations in
+the bin (default 4, i.e. most of a 60-second cadence), and a computable
+realized variance.  Expected observation counts and the achieved
+coverage fraction are stored per bar; empty bins carry NULL book
+statistics — missing data is not zero.  Realized variance is seeded
+with the last valid midquote BEFORE the bin so the first within-bin
+return is not discarded.
 """
 
 from __future__ import annotations
@@ -36,6 +43,14 @@ BIN_SECONDS = 300.0
 LOGIT_CLIP = 1e-3
 
 
+def _grid(first: float, end: float, step: float) -> list[float]:
+    out, current = [], first
+    while current < end:
+        out.append(current)
+        current += step
+    return out
+
+
 def logit(price: float, clip: float = LOGIT_CLIP) -> float:
     p = min(max(price, clip), 1.0 - clip)
     return math.log(p / (1.0 - p))
@@ -45,6 +60,13 @@ def logit(price: float, clip: float = LOGIT_CLIP) -> float:
 class LiquidityBarConfig:
     bin_seconds: float = BIN_SECONDS
     logit_clip: float = LOGIT_CLIP
+    expected_observation_seconds: float = 60.0
+    min_book_observations: int = 4
+
+    @property
+    def expected_book_observations(self) -> int:
+        return max(1, int(self.bin_seconds
+                          // self.expected_observation_seconds))
 
 
 def build_liquidity_bars(
@@ -89,20 +111,23 @@ def build_liquidity_bars(
         start = min(candidates)
     if end is None:
         candidates = [r[0] for r in books] + [r[0] for r in executions]
-        end = max(candidates) + config.bin_seconds
+        # inclusive of the bin containing the last observation, without
+        # an extra empty trailing bin
+        end = max(candidates) + 1e-6
     first_bin = math.floor(start / config.bin_seconds) * config.bin_seconds
-
-    bins: dict[float, dict] = {}
-
-    def bin_of(ts: float) -> dict | None:
-        bin_start = math.floor(ts / config.bin_seconds) * config.bin_seconds
-        if bin_start < first_bin or bin_start >= end:
-            return None
-        return bins.setdefault(bin_start, {
+    # REGULAR grid: every bin exists, including empty ones
+    bins: dict[float, dict] = {
+        bin_start: {
             "spreads": [], "spread_ticks": [], "best_sizes": [],
             "total_depths": [], "imbalances": [], "logits": [],
             "turnover": 0.0, "executions": 0,
-        })
+        }
+        for bin_start in _grid(first_bin, end, config.bin_seconds)
+    }
+
+    def bin_of(ts: float) -> dict | None:
+        bin_start = math.floor(ts / config.bin_seconds) * config.bin_seconds
+        return bins.get(bin_start)
 
     for (observed_at, bid, ask, spread, bid_depth, ask_depth, imbalance,
          best_bid_size, best_ask_size, tick_size) in books:
@@ -137,8 +162,15 @@ def build_liquidity_bars(
 
     reader = SQLiteNormalizedReader(conn)
     feature_version = feature_version_hash(
-        {"liquidity_bars": {"bin_seconds": config.bin_seconds,
-                            "logit_clip": config.logit_clip}}
+        {"liquidity_bars": {
+            "bin_seconds": config.bin_seconds,
+            "logit_clip": config.logit_clip,
+            "min_book_observations": config.min_book_observations,
+            "expected_observation_seconds":
+                config.expected_observation_seconds,
+            "grid": "regular_including_empty",
+            "rv_seed": "previous_close",
+        }}
     )
     now = time.time()
     written = 0
@@ -146,19 +178,31 @@ def build_liquidity_bars(
     def mean(values: list[float]) -> float | None:
         return sum(values) / len(values) if values else None
 
+    previous_close: float | None = None
     for bin_start in sorted(bins):
         bucket = bins[bin_start]
         bin_end = bin_start + config.bin_seconds
         logits = bucket["logits"]
+        # seed with the last valid midquote BEFORE the bin so the first
+        # within-bin return is kept
+        series = ([previous_close] if previous_close is not None else []) \
+            + logits
         realized_variance = (
-            sum(
-                (b - a) ** 2 for a, b in zip(logits, logits[1:])
-            ) if len(logits) >= 2 else None
+            sum((b - a) ** 2 for a, b in zip(series, series[1:]))
+            if len(series) >= 2 and logits else None
         )
         blocked = bool(
             reader.blocking_gaps(condition_id, bin_start, bin_end)
         )
-        coverage_complete = bool(logits) and not blocked
+        expected = config.expected_book_observations
+        coverage_fraction = min(1.0, len(logits) / expected)
+        coverage_complete = (
+            not blocked
+            and len(logits) >= config.min_book_observations
+            and realized_variance is not None
+        )
+        if logits:
+            previous_close = logits[-1]
         conn.execute(
             """
             INSERT OR REPLACE INTO liquidity_bars
@@ -167,10 +211,10 @@ def build_liquidity_bars(
                  realized_variance, turnover_notional, spread_mean,
                  spread_ticks_mean, best_book_size_mean,
                  total_depth_mean, imbalance_mean,
-                 book_observation_count, execution_count,
+                 book_observation_count, expected_book_observation_count,
+                 book_coverage_fraction, blocking_gap, execution_count,
                  coverage_complete, feature_version, computed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 condition_id, bin_start, bin_end, config.bin_seconds,
@@ -186,6 +230,9 @@ def build_liquidity_bars(
                 mean(bucket["total_depths"]),
                 mean(bucket["imbalances"]),
                 len(logits),
+                expected,
+                coverage_fraction,
+                int(blocked),
                 bucket["executions"],
                 int(coverage_complete),
                 feature_version,

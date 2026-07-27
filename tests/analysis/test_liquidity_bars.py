@@ -83,7 +83,10 @@ def test_bar_logit_ohlc_realized_variance_and_turnover(conn):
     _execution(conn, T0 + 30, 12.5)
     _execution(conn, T0 + 200, 7.5)
     conn.commit()
-    assert build_liquidity_bars(conn, COND) >= 1
+    assert build_liquidity_bars(
+        conn, COND,
+        config=LiquidityBarConfig(min_book_observations=3),
+    ) >= 1
     row = conn.execute(
         "SELECT logit_open, logit_high, logit_low, logit_close, "
         "realized_variance, turnover_notional, spread_mean, "
@@ -118,6 +121,7 @@ def test_bar_without_books_records_turnover_but_incomplete(conn):
     _execution(conn, T0 + 30, 5.0)
     conn.commit()
     build_liquidity_bars(conn, COND)
+    # empty-bin grid regularity is covered separately below
     row = conn.execute(
         "SELECT logit_close, spread_mean, turnover_notional, "
         "coverage_complete FROM liquidity_bars WHERE bin_start = ?",
@@ -225,3 +229,68 @@ def test_book_preferred_falls_back_with_flag(conn):
         "0x-none", T0 + 100, 3600.0, policy="book_preferred"
     )
     assert source == "none" and rows == []
+
+
+
+def test_coverage_needs_min_observations_and_variance(conn):
+    # 3 observations with default min=4: values exist, coverage does not
+    for i, (bid, ask) in enumerate([(0.40, 0.44), (0.42, 0.46),
+                                    (0.38, 0.42)]):
+        _book(conn, T0 + 60 * i, bid, ask)
+    conn.commit()
+    build_liquidity_bars(conn, COND)
+    row = conn.execute(
+        "SELECT book_observation_count, expected_book_observation_count, "
+        "book_coverage_fraction, coverage_complete, blocking_gap "
+        "FROM liquidity_bars WHERE bin_start = ?", (T0,),
+    ).fetchone()
+    assert row[0] == 3 and row[1] == 5
+    assert row[2] == pytest.approx(3 / 5)
+    assert row[3] == 0 and row[4] == 0
+    # a single observation can never be complete: no within-bin return
+    conn.execute("DELETE FROM liquidity_bars")
+    conn.execute(
+        "DELETE FROM order_book_snapshots WHERE observed_at > ?", (T0,),
+    )
+    conn.commit()
+    build_liquidity_bars(
+        conn, COND, config=LiquidityBarConfig(min_book_observations=1)
+    )
+    row = conn.execute(
+        "SELECT realized_variance, coverage_complete FROM liquidity_bars "
+        "WHERE bin_start = ?", (T0,),
+    ).fetchone()
+    assert tuple(row) == (None, 0)
+
+
+def test_regular_grid_includes_empty_bins(conn):
+    _book(conn, T0 + 10, 0.40, 0.44)
+    _book(conn, T0 + 3 * 300 + 10, 0.42, 0.46)   # two empty bins between
+    conn.commit()
+    build_liquidity_bars(conn, COND)
+    rows = conn.execute(
+        "SELECT bin_start, book_observation_count, coverage_complete "
+        "FROM liquidity_bars ORDER BY bin_start"
+    ).fetchall()
+    assert [r[0] for r in rows] == [T0, T0 + 300, T0 + 600, T0 + 900]
+    assert [r[1] for r in rows] == [1, 0, 0, 1]   # empties are EXPLICIT
+    assert all(r[2] == 0 for r in rows)
+
+
+def test_realized_variance_seeded_with_previous_close(conn):
+    for i, (bid, ask) in enumerate(
+        [(0.40, 0.44), (0.40, 0.44), (0.40, 0.44), (0.40, 0.44)]
+    ):
+        _book(conn, T0 + 60 * i, bid, ask)        # bin 1: flat, close .42
+    for i, (bid, ask) in enumerate(
+        [(0.48, 0.52), (0.48, 0.52), (0.48, 0.52), (0.48, 0.52)]
+    ):
+        _book(conn, T0 + 300 + 60 * i, bid, ask)  # bin 2: jump to .50
+    conn.commit()
+    build_liquidity_bars(conn, COND)
+    rv2 = conn.execute(
+        "SELECT realized_variance FROM liquidity_bars WHERE bin_start = ?",
+        (T0 + 300,),
+    ).fetchone()[0]
+    jump = (logit(0.50) - logit(0.42)) ** 2
+    assert rv2 == pytest.approx(jump)             # first return retained

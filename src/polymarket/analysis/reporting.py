@@ -92,7 +92,10 @@ def audit_database(conn: sqlite3.Connection) -> dict:
         return row[0] if row and row[0] is not None else default
 
     report: dict = {}
-    row = one("SELECT schema_version, parser_version FROM schema_metadata")
+    row = one(
+        "SELECT schema_version, parser_version FROM schema_metadata "
+        "ORDER BY schema_version DESC LIMIT 1"
+    )
     report["schema_version"] = row["schema_version"] if row else None
     report["parser_version"] = row["parser_version"] if row else None
 

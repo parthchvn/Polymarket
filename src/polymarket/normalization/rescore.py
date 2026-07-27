@@ -5,18 +5,20 @@ chosen scorer (rule-based or Ollama LLM), writing NEW versioned
 judgments — existing judgments are never rewritten or deleted, so every
 run's judgments remain auditable side by side.
 
-Temporal semantics (matching batch normalization): a judgment's
-``computed_at`` is anchored to the article's ``first_observed_at`` —
-relevance is a property of (article, contract) available from the
-moment the article was observed — plus a one-second method offset so
-the rescored judgment (a) has a distinct primary key and (b) becomes
-the LATEST judgment per family, which the as-of relevance snapshot
-prefers.  Provenance (method, model version, wall-clock rescore time)
-is recorded on every row.
-
-Resumable: (family, market, version, method, model_version)
-combinations that already have a judgment are skipped, so an
-interrupted long LLM run continues where it stopped.
+Identity and time semantics: every judgment row carries a
+deterministic ``relevance_judgment_id`` over (claim, family, market,
+contract version, method, model version), so different scorers never
+collide, later claims inside an already-scored family still get their
+own judgments, and re-running is naturally resumable (existing ids are
+skipped).  Two timestamps are kept apart honestly:
+``source_effective_at`` — when the underlying text became available —
+and ``scored_at`` — when this scorer actually ran.  ``computed_at``
+(the as-of ordering key) is anchored to ``source_effective_at`` plus a
+one-second method offset so retrospective analyses can use frozen
+scorers over pre-decision text while the rescore supersedes batch
+judgments in latest-per-family snapshots; live-online analyses that
+must not pretend an LLM result predated its computation should order
+by ``scored_at`` instead.
 """
 
 from __future__ import annotations
@@ -66,13 +68,8 @@ def rescore_news(
     ``.version`` attribute).  Returns counters.  Never rewrites."""
     model_version = getattr(scorer, "version", "unversioned")
     existing = {
-        tuple(row) for row in conn.execute(
-            """
-            SELECT event_family_id, market_id, contract_version_seq
-            FROM relevance_judgments
-            WHERE method = ? AND model_version = ?
-            """,
-            (method, model_version),
+        row[0] for row in conn.execute(
+            "SELECT relevance_judgment_id FROM relevance_judgments"
         )
     }
     counters: dict[str, Any] = {
@@ -80,12 +77,17 @@ def rescore_news(
         "by_class": {}, "method": method, "model_version": model_version,
     }
     now = time.time()
+    from polymarket.collection.canonical import namespace_id
+
     for row in _targets(conn):
-        key = (row["event_family_id"], row["market_id"], row["version_seq"])
-        if key in existing:
+        judgment_id = namespace_id(
+            "relevance", row["claim_id"], row["event_family_id"],
+            row["market_id"], row["version_seq"], method, model_version,
+        )
+        if judgment_id in existing:
             counters["skipped_existing"] += 1
             continue
-        existing.add(key)  # one judgment per family/market/version/run
+        existing.add(judgment_id)
         try:
             scored = scorer.score(
                 row["claim_text"], row["question"], row["rules_text"]
@@ -99,22 +101,20 @@ def rescore_news(
         conn.execute(
             """
             INSERT OR IGNORE INTO relevance_judgments
-                (event_family_id, market_id, contract_version_seq,
-                 computed_at, rel_class, rel_score, direction, novelty,
-                 surprise, method, model_version, evidence_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                (relevance_judgment_id, claim_id, event_family_id,
+                 market_id, contract_version_seq, source_effective_at,
+                 scored_at, computed_at, rel_class, rel_score, direction,
+                 novelty, surprise, method, model_version, evidence_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
             """,
             (
-                row["event_family_id"], row["market_id"],
-                row["version_seq"],
+                judgment_id, row["claim_id"], row["event_family_id"],
+                row["market_id"], row["version_seq"],
+                float(row["first_observed_at"]), now,
                 float(row["first_observed_at"]) + _METHOD_OFFSET_SECONDS,
                 scored["rel_class"], scored["rel_score"],
                 scored["direction"], method, model_version,
-                canonical_json({
-                    "rescored_at": now,
-                    "claim_id": row["claim_id"],
-                    **(scored.get("evidence") or {}),
-                }),
+                canonical_json(scored.get("evidence") or {}),
             ),
         )
         counters["scored"] += 1
