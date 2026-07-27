@@ -22,10 +22,21 @@ Assignment basis and availability honesty:
   on later bars, so these screens are for paper replication and
   offline analysis only, never for online availability claims.
 
-Claims whose surrounding bins lack complete assignments get
-``screen_status = 'insufficient_coverage'`` instead of a silent skip:
-absence of coverage is recorded, never conflated with absence of
-impact.
+Model availability: an ``online_filtered`` screen additionally
+requires that the fitted model EXISTED before the news — the run's
+``fit_cutoff`` is its ``model_effective_from``, and claims arriving
+before it get ``screen_status = 'model_unavailable'`` under the online
+basis (a model trained partly on bars after an event must not claim to
+have screened that event online).  Retrospective screens are exempt by
+definition.
+
+Boundary coverage is three-valued: IMPACTFUL when any observed
+boundary is calm->event; NOT impactful only when BOTH boundaries were
+observed and neither transitions; ``partial_coverage`` when only one
+boundary was observable and it did not transition (the unobserved
+boundary could have carried the transition); ``insufficient_coverage``
+when neither boundary was observable.  Absence of coverage is never
+conflated with absence of impact.
 """
 
 from __future__ import annotations
@@ -84,9 +95,11 @@ def screen_news_impact(
     }
     counters = {
         "screened": 0, "impactful": 0, "insufficient_coverage": 0,
+        "partial_coverage": 0, "model_unavailable": 0,
         "mode_run_id": mode_run_id,
         "assignment_basis": assignment_basis,
     }
+    model_effective_from = float(run["fit_cutoff"])
     now = time.time()
     for target in _news_targets(conn):
         news_time = float(target["news_time"])
@@ -101,17 +114,31 @@ def screen_news_impact(
         after_jump = arrival == "calm" and post == "event"
         evaluable_before = pre is not None and arrival is not None
         evaluable_after = arrival is not None and post is not None
-        if not evaluable_before and not evaluable_after:
+        observed = (
+            (1 if evaluable_before else 0)
+            + (1 if evaluable_after else 0)
+        )
+        if (assignment_basis == "online_filtered"
+                and news_time < model_effective_from):
+            # the model did not exist before this news
+            status, transition = "model_unavailable", 0
+            counters["model_unavailable"] += 1
+        elif observed == 0:
             status, transition = "insufficient_coverage", 0
             counters["insufficient_coverage"] += 1
-        else:
-            status = "screened"
-            transition = int(bool(
-                (evaluable_before and before_jump)
-                or (evaluable_after and after_jump)
-            ))
+        elif (evaluable_before and before_jump) or (
+                evaluable_after and after_jump):
+            status, transition = "screened", 1
             counters["screened"] += 1
-            counters["impactful"] += transition
+            counters["impactful"] += 1
+        elif observed == 2:
+            status, transition = "screened", 0   # both clear: reliable
+            counters["screened"] += 1
+        else:
+            # one boundary observed, no transition on it: the missing
+            # boundary could have carried the jump
+            status, transition = "partial_coverage", 0
+            counters["partial_coverage"] += 1
         conn.execute(
             """
             INSERT OR REPLACE INTO news_impact_screens
@@ -119,8 +146,9 @@ def screen_news_impact(
                  assignment_basis, news_time, arrival_bin_start,
                  pre_mode_label, arrival_mode_label, post_mode_label,
                  transition_detected, impact_score, screen_status,
-                 screen_available_at, screen_model_version, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 screen_available_at, model_effective_from,
+                 screen_model_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 mode_run_id, target["claim_id"],
@@ -128,7 +156,7 @@ def screen_news_impact(
                 assignment_basis, news_time, arrival_bin, pre, arrival,
                 post, transition, float(transition), status,
                 arrival_bin + 2 * bin_seconds,  # end of bin t+1
-                run["model_version"], now,
+                model_effective_from, run["model_version"], now,
             ),
         )
     conn.commit()

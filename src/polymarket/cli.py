@@ -245,6 +245,79 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_underreaction(args) -> int:
+    import json as _json
+    import os as _os
+
+    from polymarket.analysis.attention import (
+        distraction_interaction_regression,
+    )
+    from polymarket.analysis.news_returns import (
+        DecompositionConfig,
+        build_interval_records,
+        daily_aggregation,
+    )
+    from polymarket.analysis.underreaction import (
+        event_absorption,
+        run_drift_regressions,
+    )
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    _os.makedirs(args.output, exist_ok=True)
+    config = DecompositionConfig(
+        bin_seconds=args.bin_seconds,
+        mode_run_id=args.mode_run_id,
+        screen_basis=args.screen_basis,
+    )
+    specs = ["all_relevant"]
+    if args.mode_run_id:
+        specs.append("screened_impactful")
+    report: dict = {"specs": {}}
+    for spec in specs:
+        records = build_interval_records(conn, config, spec)
+        news_n = sum(1 for r in records if r.is_news)
+        regressions = run_drift_regressions(
+            conn, config, spec, records=records
+        )
+        placebo = run_drift_regressions(
+            conn, config, spec, records=records, placebo_seed=1337
+        )
+        report["specs"][spec] = {
+            "intervals": len(records),
+            "news_intervals": news_n,
+            "daily": daily_aggregation(records)[:50],
+            "drift_regressions": [r.as_dict() for r in regressions],
+            "placebo_regressions": [r.as_dict() for r in placebo],
+        }
+        events = event_absorption(conn, config, spec)
+        with open(
+            _os.path.join(args.output, f"events_{spec}.jsonl"), "w"
+        ) as handle:
+            for event in events:
+                handle.write(_json.dumps(event, sort_keys=True) + "\n")
+        report["specs"][spec]["events"] = len(events)
+        interaction = distraction_interaction_regression(
+            conn, config, spec, mode_run_id=args.mode_run_id
+        )
+        report["specs"][spec]["distraction_interaction"] = interaction
+    report["analyst_revision_mechanism"] = (
+        "UNTESTED: requires an external expectations series the "
+        "pipeline does not have"
+    )
+    path = _os.path.join(args.output, "underreaction_report.json")
+    with open(path, "w") as handle:
+        _json.dump(report, handle, indent=2, sort_keys=True)
+    for spec, block in report["specs"].items():
+        print(f"[{spec}] intervals={block['intervals']} "
+              f"news={block['news_intervals']} "
+              f"regressions={len(block['drift_regressions'])}")
+    print(f"wrote {path}")
+    conn.close()
+    return 0
+
+
 def cmd_fit_liquidity_modes(args) -> int:
     import json as _json
     import time as _time
@@ -484,6 +557,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "underreaction-analysis",
+        help="news/non-news decomposition and drift regressions "
+             "(Pervasive Underreaction)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--bin-seconds", type=float, default=900.0)
+    p.add_argument("--mode-run-id", default=None,
+                   help="enables the screened_impactful spec and the "
+                        "event-mode prevalence proxy")
+    p.add_argument("--screen-basis", default="retrospective_smoothed",
+                   choices=["retrospective_smoothed", "online_filtered"])
+    p.set_defaults(func=cmd_underreaction)
 
     p = sub.add_parser(
         "fit-liquidity-modes",

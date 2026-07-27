@@ -77,13 +77,51 @@ training-bar identity.
 Bars form a regular grid with explicit incomplete bins; incomplete
 bars break DP chains instead of being interpolated.
 
-## Pervasive Underreaction (planned: PR 9)
+## Pervasive Underreaction
 
-The 15-minute news/non-news return decomposition, future-drift
-regressions, and attention/distraction tests are the next PR.  The
-analyst-revision mechanism requires an external expectations series
-the pipeline does not have; per the review it will be described as
-untested, not replicated.
+**Implemented** (`underreaction-analysis`):
+
+* 15-minute log-odds interval returns from complete book-mid bars
+  (contiguous pairs only — gaps break, never bridge);
+* the news / non-news decomposition under two specifications: any
+  relevant claim in the interval (``all_relevant``) and only
+  liquidity-screen-impactful claims (``screened_impactful``,
+  basis-aware), plus fixed-UTC-day aggregation;
+* interval-level local projections of future log-odds changes on
+  r_news and r_nonnews with market fixed effects, controls
+  (probability level, spread, log1p turnover, trailing volatility) and
+  CR1 cluster-robust standard errors by market and by UTC day — the
+  paper's central finding corresponds to beta_news > 0 with the
+  non-news loading far smaller;
+* a permutation placebo (news labels shuffled within market) that must
+  collapse the news loading;
+* event-level initial response vs later drift, same-direction
+  continuation, and the absorption fraction A_e = |initial| /
+  (|initial| + |drift|) — explicitly OUR adaptation, labelled on every
+  record; missing closes yield missing outcomes, never zeros (drift
+  endpoints require a fresh close near the target time);
+* distraction proxies computable from Polymarket data alone
+  (cross-market claim volume, unrelated active families, weekend
+  timing, optional event-mode prevalence) and the interaction
+  regression testing whether drift after news strengthens under high
+  distraction.
+
+**Adaptations, marked as such:** interval-level local projections
+replace the paper's daily aggregation (the daily view is also
+reported); A_e is ours.  **Untested, not replicated:** the
+analyst-revision mechanism — it requires an external expectations
+series the pipeline does not have; the report says so explicitly.
+
+**Model-availability discipline (screens):** an online-basis screen
+additionally requires the mode model to have EXISTED before the news
+(``news_time >= fit_cutoff``; violations are ``model_unavailable``),
+and single-boundary non-transitions are ``partial_coverage`` rather
+than reliable negatives — only two clear boundaries certify
+non-impact.  Mode-run ids hash the full training data (per-bar values
+and feature versions) and the fitted centroids.  Pooled-fallback
+transfer to unseen markets is implemented but scientifically
+unvalidated across categories; stratified reference cells are future
+work before transfer results are used in claims.
 
 ## Relevance availability policies
 
