@@ -12,7 +12,7 @@ import sqlite3
 import time
 
 SCHEMA_VERSION = 1
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 
 PRAGMAS = [
     "PRAGMA foreign_keys = ON;",

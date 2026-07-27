@@ -173,6 +173,8 @@ def build_drc_record(
     # --- resolve final status, primary template, agreement ---------------
     primary = posterior.primary_template if posterior else None
     status = posterior_status
+    if primary == "MIXED_OR_UNRESOLVED":  # defensive: never a primary
+        primary, status = None, "ambiguous"
     agreement_score = 0.0
     cf_failures: list[str] = []
     if primary is not None:
@@ -200,6 +202,7 @@ def build_drc_record(
     ]
     if layer1.coverage_complete is False:
         assumptions.append("context coverage incomplete")
+    assumptions.extend(layer1.notes)  # e.g. the min_train_rows gate
 
     def clean(value: float) -> float | None:
         return None if not np.isfinite(value) else float(value)

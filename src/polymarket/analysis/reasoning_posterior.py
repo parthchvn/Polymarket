@@ -285,6 +285,10 @@ def infer_posterior(
         status, primary = "insufficient_context", None
     elif layer1_status not in ("accepted",):
         status, primary = "ambiguous", None
+    elif top_name == "MIXED_OR_UNRESOLVED":
+        # MIXED means "no single hypothesis": it is a resolution status,
+        # never an accepted primary template
+        status, primary = "ambiguous", None
     elif (
         top_p < config.min_top_probability
         or margin < config.min_top_margin

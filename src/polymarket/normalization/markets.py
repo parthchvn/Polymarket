@@ -28,6 +28,7 @@ explicit ``sign`` field (confidence ``explicit``), Yes/No-style labels
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from typing import Any
@@ -55,6 +56,60 @@ def _token_sign(token: dict[str, Any], index: int) -> tuple[int | None, str]:
     return None, "unknown"
 
 
+def _iso_epoch(value: Any) -> float | None:
+    """ISO-8601 timestamps (production gamma) to epoch seconds."""
+    if value is None or isinstance(value, (int, float)):
+        return value
+    try:
+        from datetime import datetime
+
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _adapt_production_market(record: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a production gamma record to the parser's canonical shape.
+
+    Production gamma serves ``clobTokenIds`` and ``outcomes`` as JSON
+    strings, ``description`` instead of ``rules``, ``acceptingOrders``
+    instead of ``tradingEnabled`` and ISO-8601 timestamps.  Synthetic /
+    canonical records pass through untouched.  The RAW payload is never
+    modified — adaptation happens at parse time only.
+    """
+    if "tokens" in record or "clobTokenIds" not in record:
+        return record
+    adapted = dict(record)
+    try:
+        token_ids = json.loads(record.get("clobTokenIds") or "[]")
+        outcomes = json.loads(record.get("outcomes") or "[]")
+    except (TypeError, ValueError):
+        token_ids, outcomes = [], []
+    adapted["tokens"] = [
+        {
+            "token_id": token_id,
+            "outcome": outcomes[i] if i < len(outcomes) else None,
+        }
+        for i, token_id in enumerate(token_ids)
+    ]
+    if "rules" not in adapted:
+        adapted["rules"] = record.get("description")
+    if "tradingEnabled" not in adapted:
+        adapted["tradingEnabled"] = bool(
+            record.get("acceptingOrders", record.get("active", True))
+        )
+    if "resolved" not in adapted:
+        adapted["resolved"] = (
+            str(record.get("umaResolutionStatus") or "").lower() == "resolved"
+        )
+    if "resolutionTime" not in adapted:
+        adapted["resolutionTime"] = _iso_epoch(record.get("endDate"))
+    adapted["createdAt"] = _iso_epoch(record.get("createdAt"))
+    adapted["closedAt"] = _iso_epoch(record.get("closedAt"))
+    return adapted
+
+
 def normalize_market_records(
     conn: sqlite3.Connection,
     raw_row: sqlite3.Row,
@@ -66,6 +121,7 @@ def normalize_market_records(
     raw_id = int(raw_row["raw_response_id"])
     for index, record in enumerate(records):
         rec_hash = raw_record_hash(record)
+        record = _adapt_production_market(record)
         condition_id = record.get("conditionId")
         market_id = record.get("id") or condition_id
         if not condition_id or not market_id:
