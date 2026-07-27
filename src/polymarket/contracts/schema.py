@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PARSER_VERSION = "1.1.0"
 
 PRAGMAS = [
@@ -275,6 +275,9 @@ DDL: list[str] = [
         bid_depth REAL,
         ask_depth REAL,
         imbalance REAL,
+        best_bid_size REAL,
+        best_ask_size REAL,
+        tick_size REAL,
         raw_response_id INTEGER NOT NULL,
         parser_version TEXT NOT NULL,
         schema_version INTEGER NOT NULL,
@@ -362,6 +365,31 @@ DDL: list[str] = [
         evidence TEXT,
         confidence REAL,
         FOREIGN KEY (claim_id) REFERENCES news_claims(claim_id)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_bars (
+        condition_id TEXT NOT NULL,
+        bin_start REAL NOT NULL,
+        bin_end REAL NOT NULL,
+        bin_seconds REAL NOT NULL,
+        logit_open REAL,
+        logit_high REAL,
+        logit_low REAL,
+        logit_close REAL,
+        realized_variance REAL,
+        turnover_notional REAL NOT NULL DEFAULT 0,
+        spread_mean REAL,
+        spread_ticks_mean REAL,
+        best_book_size_mean REAL,
+        total_depth_mean REAL,
+        imbalance_mean REAL,
+        book_observation_count INTEGER NOT NULL DEFAULT 0,
+        execution_count INTEGER NOT NULL DEFAULT 0,
+        coverage_complete INTEGER NOT NULL,
+        feature_version TEXT NOT NULL,
+        computed_at REAL NOT NULL,
+        PRIMARY KEY (condition_id, bin_start, bin_seconds)
     );
     """,
     """
@@ -470,3 +498,41 @@ def table_names(conn: sqlite3.Connection) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).fetchall()
     return {row["name"] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+_PAPER_COLUMNS = {
+    "order_book_snapshots": (
+        ("best_bid_size", "REAL"),
+        ("best_ask_size", "REAL"),
+        ("tick_size", "REAL"),
+    ),
+}
+
+
+def ensure_paper_schema(conn: sqlite3.Connection) -> list[str]:
+    """Idempotently upgrade an existing database to the paper-compatible
+    data contract (schema version 2): best-level book sizes, tick size,
+    and the liquidity_bars table.  Safe to run on live databases; ALTERs
+    are additive only."""
+    applied: list[str] = []
+    for table, columns in _PAPER_COLUMNS.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for name, sql_type in columns:
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+                )
+                applied.append(f"{table}.{name}")
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'liquidity_bars'"
+    ).fetchone()
+    if row is None:
+        for statement in DDL:
+            if "liquidity_bars" in statement:
+                conn.executescript(statement)
+                applied.append("liquidity_bars")
+    conn.commit()
+    return applied

@@ -18,11 +18,11 @@ def test_build_synthetic_audit_and_analysis(tmp_path, capsys):
     assert main(["build-synthetic", "--db", db, "--overwrite"]) == 0
     assert main(["audit", "--db", db]) == 0
     out = capsys.readouterr().out
-    assert "schema version: 1" in out
+    assert "schema version: 2" in out
 
     assert main(["audit", "--db", db, "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
 
     output = str(tmp_path / "analysis")
     assert main(["run-analysis", "--db", db, "--output", output,

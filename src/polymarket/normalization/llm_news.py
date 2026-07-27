@@ -5,7 +5,14 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from ollama import chat
+try:  # optional dependency: only needed for --method ollama
+    from ollama import chat
+except ImportError:  # pragma: no cover - exercised via monkeypatch in tests
+    def chat(*args, **kwargs):  # type: ignore[misc]
+        raise RuntimeError(
+            "the 'ollama' package is not installed; "
+            "pip install ollama to use the LLM relevance scorer"
+        )
 from pydantic import BaseModel, Field
 
 

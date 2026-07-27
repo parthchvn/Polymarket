@@ -23,6 +23,7 @@ FEATURE_GROUPS = {
     "market": [
         "mkt_last_price", "mkt_last_price_missing",
         "mkt_return_short", "mkt_return_long", "mkt_volatility",
+        "mkt_state_from_executions",
         "mkt_volume", "mkt_spread", "mkt_spread_missing",
         "mkt_depth", "mkt_imbalance", "mkt_execution_rate",
     ],
@@ -227,6 +228,10 @@ def compute_features(
 
     # ---- market state ----------------------------------------------------
     states = context.market_state
+    f["mkt_state_from_executions"] = (
+        1.0 if context.coverage.get("market_series_source") == "executions"
+        else 0.0
+    )
     prices = [
         (s["ts"], s["positive_price"])
         for s in states

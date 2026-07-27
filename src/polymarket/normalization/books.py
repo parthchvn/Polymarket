@@ -69,16 +69,32 @@ def normalize_books(
         imbalance = None
         if bid_depth is not None and ask_depth is not None and bid_depth + ask_depth > 0:
             imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+        # the screening paper's book-size variable is the volume at the
+        # BEST bid/ask, not summed depth — store both, never conflated
+        best_bid_size = next(
+            (size for price, size in bids if price == best_bid), None
+        )
+        best_ask_size = next(
+            (size for price, size in asks if price == best_ask), None
+        )
+        try:
+            tick_size = (
+                float(record["tick_size"]) if "tick_size" in record else None
+            )
+        except (TypeError, ValueError):
+            tick_size = None
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO order_book_snapshots
                 (asset, observed_at, best_bid, best_ask, spread, bid_depth,
-                 ask_depth, imbalance, raw_response_id, parser_version,
+                 ask_depth, imbalance, best_bid_size, best_ask_size,
+                 tick_size, raw_response_id, parser_version,
                  schema_version, normalized_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (asset, observed_at, best_bid, best_ask, spread, bid_depth,
-             ask_depth, imbalance, raw_id, PARSER_VERSION, SCHEMA_VERSION, now),
+             ask_depth, imbalance, best_bid_size, best_ask_size, tick_size,
+             raw_id, PARSER_VERSION, SCHEMA_VERSION, now),
         )
         (result.add_inserted if cur.rowcount else result.add_ignored)(
             "order_book_snapshots"

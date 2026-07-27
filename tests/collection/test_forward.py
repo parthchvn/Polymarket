@@ -36,8 +36,9 @@ def conn(tmp_path):
 
 def _config(**overrides):
     defaults = dict(
-        condition_ids=CONDITIONS, interval_seconds=300.0,
-        activity_every=3, news_every=2, news_queries=("q",),
+        condition_ids=CONDITIONS, book_every=300.0, trade_every=300.0,
+        market_every=300.0, activity_every_seconds=900.0,
+        news_every_seconds=600.0, news_queries=("q",),
     )
     defaults.update(overrides)
     return ForwardConfig(**defaults)
@@ -52,26 +53,40 @@ def _stub(log, name, fail_on: set[int] | None = None):
     return surface
 
 
-def test_every_cycle_vs_every_k_scheduling(conn):
+def test_per_surface_cadence_scheduling(conn):
+    """Books tick every loop tick; slower surfaces run only when their
+    second-based cadence is due — trade calls are never repeated at
+    book frequency."""
     log: list = []
-    config = _config()
+    config = _config(book_every=60.0, trade_every=300.0,
+                     activity_every_seconds=600.0)
+
+    def gated(name, cadence):
+        def surface(c, cfg, st, w):
+            if not st.due(name, cadence, w[1]):
+                return "(not due)"
+            log.append((st.cycle_index, name))
+            st.mark(name, w[1])
+            return "ok"
+        return surface
+
     surfaces = {
-        "books": (_stub(log, "books"), "books"),
+        "books": (gated("books", config.book_every), "books"),
+        "trades": (gated("trades", config.trade_every), "trades"),
         "activity": (
-            lambda c, cfg, st, w: (
-                "skip" if st.cycle_index % cfg.activity_every else
-                (log.append((st.cycle_index, "activity", w)) or "ok")
-            ),
-            None,
+            gated("activity", config.activity_every_seconds), None
         ),
     }
     state = LoopState()
-    for _ in range(6):
-        run_cycle(conn, config, state, surfaces=surfaces, now=time.time())
-    books_cycles = [c for c, n, _ in log if n == "books"]
-    activity_cycles = [c for c, n, _ in log if n == "activity"]
-    assert books_cycles == [0, 1, 2, 3, 4, 5]       # every cycle
-    assert activity_cycles == [0, 3]                 # every K cycles
+    t0 = 1_000_000.0
+    for i in range(11):                       # 10 minutes of 60s ticks
+        run_cycle(conn, config, state, surfaces=surfaces, now=t0 + 60 * i)
+    books = [c for c, n in log if n == "books"]
+    trades = [c for c, n in log if n == "trades"]
+    activity = [c for c, n in log if n == "activity"]
+    assert books == list(range(11))            # every tick
+    assert trades == [0, 5, 10]                # every 5 minutes
+    assert activity == [0, 10]                 # every 10 minutes
 
 
 def test_failure_isolation_and_bounded_gap(conn):
@@ -139,7 +154,7 @@ def test_trade_cursor_derived_from_database(conn):
 
 
 def test_downtime_gap_recorded_on_restart(conn):
-    config = _config(interval_seconds=300.0)
+    config = _config(book_every=300.0)
     now = 2_000_000.0
     assert record_downtime_gaps(conn, config, now) == 0  # fresh db: none
     _store_taker_response(conn, now - 10_000.0)          # long downtime

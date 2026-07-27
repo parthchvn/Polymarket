@@ -13,7 +13,11 @@ from polymarket.analysis.reasoning import (
     run_driver_attribution,
 )
 
-RNG = np.random.default_rng(7)
+
+def _rng(seed: int = 7) -> np.random.Generator:
+    """Every test gets its OWN generator: shared module-level RNG made
+    test outcomes depend on execution order and on the feature count."""
+    return np.random.default_rng(seed)
 
 
 def _rows(X: np.ndarray) -> list[dict[str, float]]:
@@ -23,20 +27,21 @@ def _rows(X: np.ndarray) -> list[dict[str, float]]:
     ]
 
 
-def _base_dataset(n: int = 40, informative: bool = True):
-    X = RNG.normal(size=(n, len(ATTRIBUTION_FEATURES)))
+def _base_dataset(n: int = 40, informative: bool = True, seed: int = 7):
+    rng = _rng(seed)
+    X = rng.normal(size=(n, len(ATTRIBUTION_FEATURES)))
     index = ATTRIBUTION_FEATURES.index("news_rel_max")
     if informative:
         y = np.where(X[:, index] > 0, 1.0, -1.0)
     else:
-        y = RNG.choice([-1.0, 1.0], size=n)  # pure noise: null signal
+        y = rng.choice([-1.0, 1.0], size=n)  # pure noise: null signal
     times = np.arange(n, dtype=float) * 3600.0
     ids = [f"d{i}" for i in range(n)]
     return X, y, times, ids
 
 
 def test_fit_diagnostics_reject_failed_optimiser():
-    X = RNG.normal(size=(30, 3))
+    X = _rng().normal(size=(30, 3))
     y = np.where(X[:, 0] > 0, 1.0, -1.0)
     model = LogisticModel(feature_names=["a", "b", "c"]).fit(
         X, y, max_iter=0
@@ -46,7 +51,7 @@ def test_fit_diagnostics_reject_failed_optimiser():
 
 
 def test_fit_diagnostics_reject_non_finite_inputs():
-    X = RNG.normal(size=(30, 3))
+    X = _rng().normal(size=(30, 3))
     X[5, 1] = np.nan
     y = np.where(X[:, 0] > 0, 1.0, -1.0)
     model = LogisticModel(feature_names=["a", "b", "c"]).fit(X, y)
@@ -123,8 +128,8 @@ def test_tiny_ablation_delta_fails_threshold():
 
 def test_equal_correlated_channels_become_ambiguous():
     n = 200
-    X = RNG.normal(size=(n, len(ATTRIBUTION_FEATURES))) * 0.01
-    signal = RNG.normal(size=n)
+    X = _rng().normal(size=(n, len(ATTRIBUTION_FEATURES))) * 0.01
+    signal = _rng().normal(size=n)
     # identical signal placed in two different channels
     X[:, ATTRIBUTION_FEATURES.index("news_rel_max")] = signal
     X[:, ATTRIBUTION_FEATURES.index("mkt_return_short")] = signal
@@ -143,7 +148,7 @@ def test_equal_correlated_channels_become_ambiguous():
 
 def test_stability_falls_under_unstable_resamples():
     n = 200
-    X = RNG.normal(size=(n, len(ATTRIBUTION_FEATURES))) * 0.01
+    X = _rng().normal(size=(n, len(ATTRIBUTION_FEATURES))) * 0.01
     news = ATTRIBUTION_FEATURES.index("news_rel_max")
     trend = ATTRIBUTION_FEATURES.index("mkt_return_short")
     y = np.empty(n)
@@ -151,7 +156,7 @@ def test_stability_falls_under_unstable_resamples():
     # so leave-one-block-out refits disagree about the top channel
     for block in range(4):
         rows = slice(block * (n // 4), (block + 1) * (n // 4))
-        signal = RNG.normal(size=n // 4)
+        signal = _rng().normal(size=n // 4)
         column = news if block % 2 == 0 else trend
         X[rows, column] = signal * 3
         y[rows] = np.where(signal > 0, 1.0, -1.0)

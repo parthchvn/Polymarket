@@ -73,7 +73,8 @@ ATTRIBUTION_GROUPS: dict[str, list[str]] = {
     "actor": list(FEATURE_GROUPS["actor"]),
     "market_trend": [
         "mkt_last_price", "mkt_last_price_missing", "mkt_return_short",
-        "mkt_return_long", "mkt_volatility", "mkt_volume",
+        "mkt_return_long", "mkt_volatility",
+        "mkt_state_from_executions", "mkt_volume",
     ],
     "liquidity": [
         "mkt_spread", "mkt_spread_missing", "mkt_depth", "mkt_imbalance",
