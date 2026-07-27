@@ -44,11 +44,38 @@ misattributed to the original methods.
   (relevance/direction); the two are never conflated.  A faithful
   headline-classifier replication benchmark remains future work.
 
-**Strict availability.**  A screen needs the mode of bin t+1, so
-`screen_available_at = arrival_bin_end + bin_seconds`; decisions may
-condition on a screen only when it was available strictly before the
-decision.  Bars form a regular grid with explicit incomplete bins;
-incomplete bars break DP chains instead of being interpolated.
+**Strict availability and the two decoders.**  The full-sequence DP
+backtracks from the end of the segment, so a smoothed mode at t can
+depend on later bars — those assignments (`mode_label`, basis
+`retrospective_smoothed`) are for paper replication and offline
+analysis only.  The ONLINE decoder (`mode_label_online`, basis
+`online_filtered`) is the forward pass: the mode at t uses
+observations only through t, verified by a prefix-invariance test, so
+`screen_available_at = arrival_bin_end + bin_seconds` is a true claim
+only for online-basis screens, and only those may feed live DRC
+(`impactful_news_asof` filters to them by default).  Both bases are
+persisted side by side.
+
+**Screening unit.**  The claim (article-level release) x market, as in
+the paper's per-release screening; later confirmations and corrections
+in the same event family are screened independently, with the family
+id carried for downstream aggregation.
+
+**Sparse turnover.**  Five-minute prediction-market bars legitimately
+have zero executions, which collapses turnover IQRs and would let a
+lone trade dominate every distance.  Turnover therefore decomposes
+into PRESENCE (a bounded binary dimension) and LEVEL GIVEN PRESENCE
+(log1p, reference stats fitted on positive-turnover bars only; absent
+turnover contributes level z = 0), with per-variable minimum scale
+floors and +/-10 winsorization — all recorded in the persisted
+reference stats.  Reference-cell fallback is cell -> per-condition ->
+POOLED, so markets absent from training still standardize and receive
+assignments (transfer is tested).  Mode-run ids are SHA-256 over the
+full reference statistics, configuration, model version and ordered
+training-bar identity.
+
+Bars form a regular grid with explicit incomplete bins; incomplete
+bars break DP chains instead of being interpolated.
 
 ## Pervasive Underreaction (planned: PR 9)
 

@@ -306,7 +306,9 @@ def cmd_screen_news_impact(args) -> int:
             print("no fitted mode runs; run fit-liquidity-modes first")
             return 1
         mode_run_id = row[0]
-    counters = screen_news_impact(conn, mode_run_id)
+    counters = screen_news_impact(
+        conn, mode_run_id, assignment_basis=args.assignment_basis
+    )
     print(_json.dumps(counters, indent=2, sort_keys=True))
     conn.close()
     return 0
@@ -503,6 +505,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--mode-run-id", default=None,
                    help="default: the most recent fitted run")
+    p.add_argument("--assignment-basis", default="online_filtered",
+                   choices=["online_filtered", "retrospective_smoothed"],
+                   help="online_filtered makes a TRUE availability "
+                        "claim; retrospective is for labelled offline "
+                        "paper analyses")
     p.set_defaults(func=cmd_screen_news_impact)
 
     p = sub.add_parser(

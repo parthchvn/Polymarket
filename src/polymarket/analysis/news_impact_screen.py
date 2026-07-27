@@ -7,16 +7,22 @@ The market's own liquidity reaction decides impact; semantic relevance
 and direction stay with the (LLM) relevance scorers — the two are
 never conflated.
 
-Strict availability: the screen needs the mode of bin t+1, which is
-only computable once that bin closes, so
+The screening unit is the CLAIM (article-level arrival) x market, as
+in the paper's per-release screening; event-family aggregation is a
+downstream choice, and the family id is carried on every row.
 
-    screen_available_at = arrival_bin_end + bin_seconds
+Assignment basis and availability honesty:
 
-(the end of bin t+1).  A wallet decision may condition on the screen
-only when ``screen_available_at < decision_time`` — enforced by the
-DRC integration, recorded here.
+* ``online_filtered`` (default): modes come from the forward-only
+  decoder, so the mode of bin t used observations only through t.
+  ``screen_available_at = end of bin t+1`` is then a TRUE claim, and
+  these screens may feed live DRC.
+* ``retrospective_smoothed``: modes from the full-sequence DP —
+  strictly better mode estimates, but the assignment at t can depend
+  on later bars, so these screens are for paper replication and
+  offline analysis only, never for online availability claims.
 
-Families whose surrounding bins lack complete assignments get
+Claims whose surrounding bins lack complete assignments get
 ``screen_status = 'insufficient_coverage'`` instead of a silent skip:
 absence of coverage is recorded, never conflated with absence of
 impact.
@@ -31,19 +37,22 @@ from polymarket.analysis.liquidity_modes import load_jump_model_run
 
 
 def _news_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """(event family, condition) pairs to screen: every family holding
-    any relevance judgment for the market, with the family's earliest
-    availability as the news time."""
+    """(claim, condition) pairs to screen — one row per news release
+    per market, as in the paper.  Later confirmations, corrections and
+    materially new claims in the same family are screened
+    independently; the family id rides along for aggregation."""
     return conn.execute(
         """
-        SELECT DISTINCT f.event_family_id,
-               f.earliest_available_at AS news_time,
+        SELECT DISTINCT c.claim_id,
+               c.first_available_at AS news_time,
+               e.event_family_id,
                m.condition_id
-        FROM event_families f
+        FROM news_claims c
+        JOIN claim_edges e ON e.claim_id = c.claim_id
         JOIN relevance_judgments r
-          ON r.event_family_id = f.event_family_id
+          ON r.event_family_id = e.event_family_id
         JOIN markets m ON m.market_id = r.market_id
-        ORDER BY f.earliest_available_at, f.event_family_id
+        ORDER BY c.first_available_at, c.claim_id
         """
     ).fetchall()
 
@@ -51,22 +60,32 @@ def _news_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def screen_news_impact(
     conn: sqlite3.Connection,
     mode_run_id: str,
+    assignment_basis: str = "online_filtered",
 ) -> dict:
-    """Screen every (family, market) pair under a fitted mode run.
-    Idempotent: rows are keyed by (mode_run_id, family, condition)."""
+    """Screen every (claim, market) pair under a fitted mode run.
+    Idempotent: rows keyed by (run, claim, condition, basis)."""
+    if assignment_basis not in (
+        "online_filtered", "retrospective_smoothed"
+    ):
+        raise ValueError(f"unknown assignment basis: {assignment_basis}")
+    label_column = (
+        "mode_label_online" if assignment_basis == "online_filtered"
+        else "mode_label"
+    )
     run = load_jump_model_run(conn, mode_run_id)
     bin_seconds = float(run["bin_seconds"])
     labels: dict[tuple[str, float], str] = {
-        (row["condition_id"], row["bin_start"]): row["mode_label"]
+        (row["condition_id"], row["bin_start"]): row[label_column]
         for row in conn.execute(
-            "SELECT condition_id, bin_start, mode_label "
-            "FROM liquidity_mode_assignments WHERE mode_run_id = ?",
+            f"SELECT condition_id, bin_start, {label_column} "
+            f"FROM liquidity_mode_assignments WHERE mode_run_id = ?",
             (mode_run_id,),
         )
     }
     counters = {
         "screened": 0, "impactful": 0, "insufficient_coverage": 0,
         "mode_run_id": mode_run_id,
+        "assignment_basis": assignment_basis,
     }
     now = time.time()
     for target in _news_targets(conn):
@@ -96,17 +115,18 @@ def screen_news_impact(
         conn.execute(
             """
             INSERT OR REPLACE INTO news_impact_screens
-                (mode_run_id, event_family_id, condition_id, news_time,
-                 arrival_bin_start, pre_mode_label, arrival_mode_label,
-                 post_mode_label, transition_detected, impact_score,
-                 screen_status, screen_available_at,
-                 screen_model_version, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (mode_run_id, claim_id, event_family_id, condition_id,
+                 assignment_basis, news_time, arrival_bin_start,
+                 pre_mode_label, arrival_mode_label, post_mode_label,
+                 transition_detected, impact_score, screen_status,
+                 screen_available_at, screen_model_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                mode_run_id, target["event_family_id"], condition_id,
-                news_time, arrival_bin, pre, arrival, post, transition,
-                float(transition), status,
+                mode_run_id, target["claim_id"],
+                target["event_family_id"], condition_id,
+                assignment_basis, news_time, arrival_bin, pre, arrival,
+                post, transition, float(transition), status,
                 arrival_bin + 2 * bin_seconds,  # end of bin t+1
                 run["model_version"], now,
             ),
@@ -120,16 +140,20 @@ def impactful_news_asof(
     condition_id: str,
     cutoff: float,
     mode_run_id: str,
+    assignment_basis: str = "online_filtered",
 ) -> list[sqlite3.Row]:
     """Screens usable at a decision time: strictly available before the
-    cutoff, screened (not insufficient), for this market."""
+    cutoff, screened (not insufficient), for this market.  Only
+    ``online_filtered`` screens make a true availability claim; asking
+    for retrospective screens here is for labelled offline analysis."""
     return conn.execute(
         """
         SELECT * FROM news_impact_screens
         WHERE mode_run_id = ? AND condition_id = ?
+          AND assignment_basis = ?
           AND screen_status = 'screened'
           AND screen_available_at < ?
         ORDER BY news_time
         """,
-        (mode_run_id, condition_id, cutoff),
+        (mode_run_id, condition_id, assignment_basis, cutoff),
     ).fetchall()
