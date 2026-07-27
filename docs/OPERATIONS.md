@@ -85,8 +85,19 @@ screening paper's four variables per five-minute bin, adapted to
 bounded prices: mean spread (raw and in ticks), executed notional
 turnover (canonical executions only), realized log-odds variance with
 logit OHLC, and mean BEST-level book size kept separate from mean
-total depth.  `coverage_complete` requires book observations in the
-bin and no blocking gap.
+total depth.  Bars form a REGULAR grid — empty
+intervals exist explicitly as incomplete rather than vanishing from
+the temporal sequence (dropping them would bias the jump model's
+transitions).  `coverage_complete` requires no blocking gap, at least
+`min_book_observations` (default 4) book observations, and a
+computable realized variance (seeded with the last midquote before the
+bin so the first within-bin return is kept); expected counts and the
+achieved coverage fraction are stored per bar.  Build bars with:
+
+    python -m polymarket.cli build-liquidity-bars --db runs/forward.sqlite
+
+which is incremental by default (--rebuild recomputes) and prints
+per-market coverage statistics.
 
 The canonical market series (`reader.market_series_before`) takes an
 explicit source policy — `book_only` for paper analyses,
@@ -99,10 +110,14 @@ so midquotes and trade prints are never silently mixed; the
     python -m polymarket.cli rescore-news --db runs/forward.sqlite \
         --method ollama --model qwen3:8b        # or --method rule
 
-Writes NEW versioned judgments against exact contract semantics:
-existing judgments are never rewritten, runs are resumable
-(already-scored family/market/version combinations under the same
-method+model are skipped), and rescores are stamped at article first
-observation +1s so as-of snapshots prefer them while batch judgments
-stay auditable.  The ollama method needs `pip install ollama` and a
+Writes NEW versioned judgments against exact contract semantics.
+Every judgment carries a deterministic id over (claim, family, market,
+contract version, method, model version): different scorers never
+collide, later claims in an already-scored family still get scored,
+and runs are resumable (existing ids are skipped).  Rows keep
+`source_effective_at` (text availability) and `scored_at` (when the
+scorer ran) apart; the as-of ordering key stays anchored to text
+availability +1s so rescores supersede batch judgments in snapshots,
+while live-online analyses that must not pretend an LLM result
+predated its computation can order by `scored_at`.  The ollama method needs `pip install ollama` and a
 running Ollama server.

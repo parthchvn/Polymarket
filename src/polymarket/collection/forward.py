@@ -101,28 +101,53 @@ class LoopState:
 # ---------------------------------------------------------------------------
 def derive_trade_cursor(conn) -> float | None:
     """Newest trades_taker response time — the incremental cursor."""
+    return derive_surface_cursor(conn, ("trades_taker",))
+
+
+def derive_surface_cursor(
+    conn, collectors: tuple[str, ...]
+) -> float | None:
+    """Newest stored response time across the given collectors."""
+    placeholders = ",".join("?" for _ in collectors)
     row = conn.execute(
-        "SELECT MAX(received_at) FROM raw_responses "
-        "WHERE collector = 'trades_taker'"
+        f"SELECT MAX(received_at) FROM raw_responses "
+        f"WHERE collector IN ({placeholders})",
+        collectors,
     ).fetchone()
     return row[0]
 
 
+# gap surface -> (collectors that feed it, cadence attribute)
+_SURFACE_CURSORS: dict[str, tuple[tuple[str, ...], str]] = {
+    "trades": (("trades_taker", "trades_expanded"), "trade_every"),
+    "books": (("books",), "book_every"),
+    "markets": (("markets",), "market_every"),
+    "news": (("news:google-rss",), "news_every_seconds"),
+    "activity": (("activity",), "activity_every_seconds"),
+}
+
+
 def record_downtime_gaps(conn, config: ForwardConfig, now: float) -> int:
-    """Record a bounded gap per market for downtime since the last run."""
-    last = derive_trade_cursor(conn)
-    if last is None:
-        return 0
-    if now - last <= DOWNTIME_FACTOR * config.interval_seconds:
-        return 0
-    for condition_id in config.condition_ids:
-        for surface in ("trades", "books"):
+    """Record bounded downtime gaps PER SURFACE, each measured against
+    its own last-success cursor and its own cadence.  Books collected
+    60 seconds ago must not inherit a gap because trades last ran five
+    minutes ago — and vice versa."""
+    recorded = 0
+    for surface, (collectors, cadence_attr) in _SURFACE_CURSORS.items():
+        last = derive_surface_cursor(conn, collectors)
+        if last is None:
+            continue
+        cadence = float(getattr(config, cadence_attr))
+        if now - last <= DOWNTIME_FACTOR * cadence:
+            continue
+        for condition_id in config.condition_ids:
             record_gap(
                 conn, collector="forward-loop", surface=surface,
                 object_id=condition_id, gap_start=last, gap_end=now,
-                reason="collection loop downtime",
+                reason=f"collection loop downtime ({surface})",
             )
-    return len(config.condition_ids)
+            recorded += 1
+    return recorded
 
 
 def discover_assets(conn, condition_ids: tuple[str, ...]) -> dict[str, list[str]]:

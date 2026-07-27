@@ -100,7 +100,12 @@ def test_rescore_writes_versioned_judgments_and_counts(conn):
     assert all(r[0] == "fake" and r[1] == "fake-scorer-1" for r in rows)
     # computed_at anchored to article first_observed + method offset
     assert rows[0][2] == pytest.approx(T0 + 5 + 1.0)
-    assert "rescored_at" in json.loads(rows[0][3])
+    times = conn.execute(
+        "SELECT source_effective_at, scored_at FROM relevance_judgments "
+        "ORDER BY event_family_id LIMIT 1"
+    ).fetchone()
+    assert times[0] == pytest.approx(T0 + 5)      # text availability
+    assert times[1] > times[0] + 1000             # honest scorer clock
 
 
 def test_rescore_never_rewrites_and_resumes(conn):
@@ -200,3 +205,55 @@ def test_ollama_scorer_parses_structured_response(monkeypatch):
     assert scored["rel_class"] == "supports_negative"
     assert scored["direction"] == pytest.approx(-0.7)
     assert scorer.version.startswith("ollama-test-model")
+
+
+
+def test_later_claim_in_scored_family_gets_its_own_judgment(conn):
+    rescore_news(conn, FakeScorer(), method="fake")
+    now = time.time()
+    # a follow-up claim arrives in the ALREADY-SCORED family f0
+    conn.execute(
+        "INSERT INTO news_articles (article_id, source_id, source_url, "
+        "source_published_at, first_observed_at, download_completed_at, "
+        "timestamp_source, timestamp_confidence, headline, body, "
+        "content_hash, raw_response_id, raw_record_index, "
+        "raw_record_hash, parser_version, schema_version, normalized_at) "
+        "VALUES ('a9', 's', 'u', ?, ?, ?, 'feed', 0.8, 'X confirmed', "
+        "'X confirmed', 'ch9', 1, 0, 'h', 'p', 1, ?)",
+        (T0 + 500, T0 + 505, T0 + 505, now),
+    )
+    conn.execute(
+        "INSERT INTO news_claims (claim_id, article_id, claim_text, "
+        "entities_json, quantities_json, first_available_at, "
+        "extractor_version, confidence) VALUES ('c9', 'a9', "
+        "'X confirmed', '[]', '[]', ?, 'x', 0.9)", (T0 + 505,),
+    )
+    conn.execute(
+        "INSERT INTO claim_edges (edge_id, claim_id, event_family_id, "
+        "edge_type, effective_from, evidence, confidence) VALUES "
+        "('e9', 'c9', 'f0', 'confirmation', ?, 'k', 0.5)", (T0 + 505,),
+    )
+    conn.commit()
+    second = rescore_news(conn, FakeScorer(), method="fake")
+    assert second["scored"] == 1                  # NOT skipped forever
+    assert second["skipped_existing"] == 2
+    claim_ids = {
+        r[0] for r in conn.execute(
+            "SELECT claim_id FROM relevance_judgments "
+            "WHERE event_family_id = 'f0'"
+        )
+    }
+    assert claim_ids == {"c0", "c9"}
+
+
+def test_two_scorers_never_collide(conn):
+    class OtherScorer(FakeScorer):
+        version = "other-scorer-9"
+
+    rescore_news(conn, FakeScorer(), method="fake")
+    counters = rescore_news(conn, OtherScorer(), method="fake")
+    assert counters["scored"] == 2                # no silent PK loss
+    n = conn.execute(
+        "SELECT COUNT(*) FROM relevance_judgments"
+    ).fetchone()[0]
+    assert n == 4                                  # both runs fully stored

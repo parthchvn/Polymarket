@@ -298,21 +298,32 @@ def normalize_news(
                     claim["claim_text"], market["question"], market["rules_text"]
                 )
                 novelty = 1.0 if edge_type == "new" else 0.3
+                model_version = getattr(
+                    scorer, "version", RELEVANCE_MODEL_VERSION
+                )
+                judgment_id = namespace_id(
+                    "relevance", claim_id, family_id,
+                    market["market_id"], market["version_seq"],
+                    "rule_keyword_overlap", model_version,
+                )
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO relevance_judgments
-                        (event_family_id, market_id, contract_version_seq,
-                         computed_at, rel_class, rel_score, direction,
-                         novelty, surprise, method, model_version,
-                         evidence_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (relevance_judgment_id, claim_id, event_family_id,
+                         market_id, contract_version_seq,
+                         source_effective_at, scored_at, computed_at,
+                         rel_class, rel_score, direction, novelty,
+                         surprise, method, model_version, evidence_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        family_id, market["market_id"], market["version_seq"],
-                        first_observed_at, scored["rel_class"],
-                        scored["rel_score"], scored["direction"], novelty,
+                        judgment_id, claim_id, family_id,
+                        market["market_id"], market["version_seq"],
+                        first_observed_at, now, first_observed_at,
+                        scored["rel_class"], scored["rel_score"],
+                        scored["direction"], novelty,
                         record.get("surprise"), "rule_keyword_overlap",
-                        getattr(scorer, "version", RELEVANCE_MODEL_VERSION),
+                        model_version,
                         canonical_json(scored.get("evidence", {})),
                     ),
                 )

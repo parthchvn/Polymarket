@@ -23,6 +23,7 @@ class DecisionContext:
     contract: dict | None
     market_status: dict | None
     market_state: list[dict]
+    execution_activity: list[dict]
     order_books: list[dict]
     actor_history: list[dict]
     position: dict
@@ -66,6 +67,7 @@ def build_context(
         contract=contract,
         market_status=status,
         market_state=[],
+        execution_activity=[],
         order_books=books,
         actor_history=_rows(reader.actor_trade_legs_before(t, actor=episode.actor_id)),
         position=reader.position_asof(episode.actor_id, episode.condition_id, t),
@@ -80,6 +82,16 @@ def build_context(
     )
     context.market_state = _rows(series_rows)
     context.coverage["market_series_source"] = series_source
+    # execution activity is its OWN channel: volume/rate features must
+    # come from canonical executions regardless of the price source
+    context.execution_activity = [
+        {"ts": row["ts"], "notional": row["notional"],
+         "size": row["size"]}
+        for row in reader.canonical_executions_before(
+            t, condition_id=episode.condition_id
+        )
+        if row["ts"] >= t - market_state_lookback
+    ]
     if episode.market_id and contract is not None:
         snapshot_rows, version_fallback = reader.relevance_snapshot_asof(
             episode.market_id, contract["version_seq"], t

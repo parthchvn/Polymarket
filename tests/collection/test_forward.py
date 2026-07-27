@@ -10,7 +10,6 @@ import time
 import pytest
 
 from polymarket.collection.forward import (
-    DOWNTIME_FACTOR,
     ForwardConfig,
     LoopState,
     derive_trade_cursor,
@@ -135,15 +134,19 @@ def test_third_cycle_after_failure_continues(conn):
     ).fetchone()[0] == len(CONDITIONS)               # only the failed cycle
 
 
-def _store_taker_response(conn, received_at):
-    run_id = start_collector_run(conn, "trades_taker", {"t": received_at})
+def _store_response(conn, collector, received_at):
+    run_id = start_collector_run(conn, collector, {"t": received_at})
     insert_raw_response(
-        conn, collector_run_id=run_id, collector="trades_taker",
-        base_url="stub://", endpoint="trades", params={"t": received_at},
+        conn, collector_run_id=run_id, collector=collector,
+        base_url="stub://", endpoint="x", params={"t": received_at},
         requested_at=received_at - 1, received_at=received_at,
         http_status=200, headers={}, payload=b"[]",
     )
     finish_collector_run(conn, run_id, "succeeded")
+
+
+def _store_taker_response(conn, received_at):
+    _store_response(conn, "trades_taker", received_at)
 
 
 def test_trade_cursor_derived_from_database(conn):
@@ -153,26 +156,33 @@ def test_trade_cursor_derived_from_database(conn):
     assert derive_trade_cursor(conn) == 1_000_600.0
 
 
-def test_downtime_gap_recorded_on_restart(conn):
-    config = _config(book_every=300.0)
+def test_downtime_gaps_are_surface_specific(conn):
+    config = _config(book_every=60.0, trade_every=300.0)
     now = 2_000_000.0
-    assert record_downtime_gaps(conn, config, now) == 0  # fresh db: none
-    _store_taker_response(conn, now - 10_000.0)          # long downtime
-    assert record_downtime_gaps(conn, config, now) == len(CONDITIONS)
+    assert record_downtime_gaps(conn, config, now) == 0  # fresh db
+    # books were healthy 90s ago (within 2x60s); trades stale by 20 min
+    _store_response(conn, "books", now - 90.0)
+    _store_response(conn, "trades_taker", now - 1200.0)
+    recorded = record_downtime_gaps(conn, config, now)
+    assert recorded == len(CONDITIONS)                   # trades only
     gaps = conn.execute(
         "SELECT surface, gap_start, gap_end FROM collector_gaps"
     ).fetchall()
-    assert {g[0] for g in gaps} == {"trades", "books"}
-    assert all(g[1] == now - 10_000.0 and g[2] == now for g in gaps)
-    # recent activity within the downtime factor records nothing
-    _store_taker_response(conn, now - config.interval_seconds)
-    before = conn.execute("SELECT COUNT(*) FROM collector_gaps").fetchone()[0]
-    assert record_downtime_gaps(
-        conn, config, now + DOWNTIME_FACTOR * config.interval_seconds * 0.4
-    ) == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM collector_gaps"
-    ).fetchone()[0] == before
+    assert {g[0] for g in gaps} == {"trades"}            # books untouched
+    assert all(
+        g[1] == now - 1200.0 and g[2] == now for g in gaps
+    )                                                    # OWN cursor
+    # both stale: both surfaces gap, each from its own cursor
+    conn.execute("DELETE FROM collector_gaps")
+    conn.execute("DELETE FROM raw_responses")
+    conn.commit()
+    _store_response(conn, "books", now - 400.0)          # > 2x60s
+    _store_response(conn, "trades_taker", now - 1200.0)  # > 2x300s
+    record_downtime_gaps(conn, config, now)
+    starts = dict(conn.execute(
+        "SELECT surface, MIN(gap_start) FROM collector_gaps GROUP BY 1"
+    ).fetchall())
+    assert starts == {"books": now - 400.0, "trades": now - 1200.0}
 
 
 def test_run_loop_respects_max_cycles_without_sleeping(conn):
