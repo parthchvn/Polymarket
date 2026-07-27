@@ -445,8 +445,10 @@ DDL: list[str] = [
         transition_detected INTEGER NOT NULL,
         impact_score REAL NOT NULL,
         screen_status TEXT NOT NULL CHECK (
-            screen_status IN ('screened', 'insufficient_coverage')
+            screen_status IN ('screened', 'insufficient_coverage',
+                              'partial_coverage', 'model_unavailable')
         ),
+        model_effective_from REAL NOT NULL,
         screen_available_at REAL NOT NULL,
         screen_model_version TEXT NOT NULL,
         created_at REAL NOT NULL,
@@ -588,9 +590,9 @@ _PAPER_COLUMNS = {
 }
 
 _REBUILD_IF_MISSING_COLUMN = {
-    # PR-8-shaped screens lack claim-level identity; the table is
-    # rebuilt (screens are derived data, recomputable from a mode run)
-    "news_impact_screens": "claim_id",
+    # screens are derived data, recomputable from a mode run; the
+    # marker column identifies the current shape
+    "news_impact_screens": "model_effective_from",
 }
 
 

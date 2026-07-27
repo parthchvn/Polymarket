@@ -288,23 +288,27 @@ def _news_family(conn, family_id, news_time, market_id="m-jump"):
     conn.commit()
 
 
-def _fitted(conn) -> FittedJumpModel:
+def _fitted(conn, fit_cutoff=None) -> FittedJumpModel:
+    """Fit on the EARLY part of the world (through the first training
+    event window) so that screened news, which arrives later, is
+    online-valid under the model-availability gate."""
+    cutoff = fit_cutoff if fit_cutoff is not None else T0 + 60 * BIN
     model = fit_jump_model(
-        conn, fit_cutoff=T0 + 500 * BIN,
+        conn, fit_cutoff=cutoff,
         config=JumpModelConfig(fixed_lambda=1.0),
     )
-    persist_jump_model(conn, model, T0 + 500 * BIN)
+    persist_jump_model(conn, model, cutoff)
     return model
 
 
 def test_screen_detects_calm_to_event_at_boundary(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     # news inside bin 100 (first event bin): calm(99)->event(100) is the
     # boundary immediately before the arrival bin -> impactful
     _news_family(conn, "fam-hit", T0 + 100 * BIN + 42)
     # news deep inside calm: no adjacent transition
-    _news_family(conn, "fam-miss", T0 + 40 * BIN + 42)
+    _news_family(conn, "fam-miss", T0 + 70 * BIN + 42)
     counters = screen_news_impact(conn, model.mode_run_id)
     assert counters["screened"] == 2 and counters["impactful"] == 1
     rows = {
@@ -321,7 +325,7 @@ def test_screen_detects_calm_to_event_at_boundary(conn):
 
 
 def test_screen_detects_jump_after_arrival_bin(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     # news in bin 99 (still calm), event starts at bin 100:
     # calm(99)->event(100) is the boundary immediately AFTER arrival
@@ -337,7 +341,7 @@ def test_screen_detects_jump_after_arrival_bin(conn):
 
 
 def test_event_to_calm_is_not_impactful(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     _news_family(conn, "fam-cooldown", T0 + 111 * BIN + 10)
     screen_news_impact(conn, model.mode_run_id)
@@ -349,7 +353,7 @@ def test_event_to_calm_is_not_impactful(conn):
 
 
 def test_screen_availability_is_strictly_after_next_bin(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     news_time = T0 + 100 * BIN + 42
     _news_family(conn, "fam-online", news_time)
@@ -485,7 +489,7 @@ def test_transfer_to_market_absent_from_training(conn):
 
 
 def test_screen_basis_online_vs_retrospective_rows(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     _news_family(conn, "fam-basis", T0 + 100 * BIN + 42)
     a = screen_news_impact(
@@ -508,7 +512,7 @@ def test_screen_basis_online_vs_retrospective_rows(conn):
 
 
 def test_asof_accessor_filters_by_basis(conn):
-    _regime_world(conn, event_windows=((100, 112),))
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
     model = _fitted(conn)
     _news_family(conn, "fam-asof", T0 + 100 * BIN + 42)
     screen_news_impact(
@@ -522,3 +526,82 @@ def test_asof_accessor_filters_by_basis(conn):
     assert online_rows == []                # no online screens exist yet
     screen_news_impact(conn, model.mode_run_id)
     assert impactful_news_asof(conn, COND, cutoff, model.mode_run_id)
+
+
+def test_online_screen_requires_model_to_predate_news(conn):
+    """A model trained after an event must not claim to have screened
+    it online; retrospective screening is exempt by definition."""
+    _regime_world(conn, event_windows=((30, 40), (100, 112)))
+    model = _fitted(conn, fit_cutoff=T0 + 150 * BIN)  # AFTER the news
+    _news_family(conn, "fam-past", T0 + 100 * BIN + 42)
+    online = screen_news_impact(conn, model.mode_run_id)
+    assert online["model_unavailable"] == 1
+    assert online["screened"] == 0
+    row = conn.execute(
+        "SELECT screen_status, transition_detected, model_effective_from "
+        "FROM news_impact_screens WHERE assignment_basis = "
+        "'online_filtered'"
+    ).fetchone()
+    assert row["screen_status"] == "model_unavailable"
+    assert row["transition_detected"] == 0
+    assert row["model_effective_from"] == T0 + 150 * BIN
+    # never surfaced by the online as-of accessor
+    assert impactful_news_asof(
+        conn, COND, T0 + 500 * BIN, model.mode_run_id
+    ) == []
+    # retrospective basis screens it, labelled as such
+    retro = screen_news_impact(
+        conn, model.mode_run_id,
+        assignment_basis="retrospective_smoothed",
+    )
+    assert retro["screened"] == 1 and retro["impactful"] == 1
+
+
+def test_single_clear_boundary_is_partial_not_negative(conn):
+    """calm->calm on the only observable boundary must NOT count as a
+    reliable non-impact: the missing boundary could have jumped."""
+    _regime_world(conn, n_bins=90, event_windows=((30, 40),))
+    model = _fitted(conn)
+    # news in the LAST assigned bin: post bin missing, pre->arrival
+    # observable and calm->calm
+    _news_family(conn, "fam-edge", T0 + 89 * BIN + 10)
+    counters = screen_news_impact(conn, model.mode_run_id)
+    assert counters["partial_coverage"] == 1
+    row = conn.execute(
+        "SELECT screen_status, transition_detected FROM "
+        "news_impact_screens WHERE event_family_id = 'fam-edge' "
+        "AND assignment_basis = 'online_filtered'"
+    ).fetchone()
+    assert tuple(row) == ("partial_coverage", 0)
+    # but a single observable boundary that DOES transition is still
+    # impactful: coverage starts at the arrival bin (pre missing), and
+    # the after-boundary jumps calm->event
+    conn.execute("DELETE FROM news_impact_screens")
+    _insert_bar(                       # arrival bin: calm profile
+        conn, "0xedge", T0 + 200 * BIN, spread_ticks=1.2,
+        turnover=100.0, volatility=0.01, best_size=200.0,
+    )
+    for i in (201, 202):               # then a genuine event
+        _insert_bar(
+            conn, "0xedge", T0 + i * BIN, spread_ticks=2.4,
+            turnover=600.0, volatility=0.06, best_size=100.0,
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO markets (market_id, condition_id, "
+        "question, raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-edge', '0xedge', 'Q?', 1, 0, 'h', 'p', 2, 1)",
+    )
+    conn.commit()
+    model2 = _fitted(conn)
+    _news_family(conn, "fam-edge-hit", T0 + 200 * BIN + 10,
+                 market_id="m-edge")
+    screen_news_impact(conn, model2.mode_run_id)
+    row = conn.execute(
+        "SELECT transition_detected, screen_status, pre_mode_label "
+        "FROM news_impact_screens WHERE event_family_id = "
+        "'fam-edge-hit' AND assignment_basis = 'online_filtered'"
+    ).fetchone()
+    assert row["pre_mode_label"] is None            # truly one boundary
+    assert (row["transition_detected"], row["screen_status"]) \
+        == (1, "screened")

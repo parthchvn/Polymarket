@@ -111,7 +111,8 @@ def _load_raw_bars(
 ) -> list[dict]:
     sql = (
         "SELECT condition_id, bin_start, spread_ticks_mean, spread_mean, "
-        "turnover_notional, realized_variance, best_book_size_mean "
+        "turnover_notional, realized_variance, best_book_size_mean, "
+        "feature_version "
         "FROM liquidity_bars WHERE bin_seconds = ? AND coverage_complete = 1"
     )
     args: list = [config.bin_seconds]
@@ -135,6 +136,7 @@ def _load_raw_bars(
             "turnover": row["turnover_notional"] or 0.0,
             "volatility": math.sqrt(max(row["realized_variance"], 0.0)),
             "best_book_size": row["best_book_size_mean"],
+            "feature_version": row["feature_version"],
         })
     return out
 
@@ -472,7 +474,12 @@ def fit_jump_model(
     import hashlib
 
     train_identity = [
-        (bar["condition_id"], bar["bin_start"]) for bar in train_bars
+        (
+            bar["condition_id"], bar["bin_start"], bar["spread_ticks"],
+            bar["turnover"], bar["volatility"], bar["best_book_size"],
+            bar["feature_version"],
+        )
+        for bar in train_bars
     ]
     fingerprint = hashlib.sha256(canonical_json({
         "reference_stats": stats,
@@ -488,6 +495,8 @@ def fit_jump_model(
         "variables": list(VARIABLES),
         "train_bars": train_identity,
         "fit_cutoff": fit_cutoff,
+        "centroids": centroids,
+        "calm_mode": calm_mode,
     }).encode()).hexdigest()
     mode_run_id = f"modes-{fingerprint[:32]}"
     model = FittedJumpModel(
