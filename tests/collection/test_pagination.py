@@ -79,3 +79,30 @@ def test_cursor_pagination_with_repeat_detection():
     )
     assert out.status == "incomplete"
     assert "repeated cursor" in out.note
+
+
+def test_stop_predicate_ends_pagination_keeping_the_page():
+    from polymarket.collection.pagination import paginate_offset
+
+    pages = [
+        [{"timestamp": 100 - i * 10 - j} for j in range(5)]
+        for i in range(4)
+    ]
+    fetched = []
+
+    def fetch(params):
+        index = params["offset"] // 5
+        fetched.append(index)
+        return index, pages[index]
+
+    outcome = paginate_offset(
+        fetch, limit=5, max_pages=10,
+        stop_predicate=lambda records: min(
+            r["timestamp"] for r in records
+        ) <= 85,
+    )
+    # page 0 min ts = 96 (continue), page 1 min ts = 86 (continue),
+    # page 2 min ts = 76 <= 85 -> stop WITH the page stored
+    assert fetched == [0, 1, 2]
+    assert outcome.record_count == 15
+    assert outcome.status == "complete"

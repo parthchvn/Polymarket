@@ -91,3 +91,22 @@ occurrence reasoning at production pair counts (needs batching).
    get real mid-price state and liquidity history.
 2. Ollama LLM news relevance on the collected articles, with tests.
 3. Occurrence-target batching for production pair universes.
+
+## Addendum: forward-collection loop verified live (same day)
+
+The `collect-loop` command ran real cycles against the three pilot
+markets: incremental trades (600 records/cycle after the client-side
+early stop replaced the non-functional server-side `after` filter),
+a book snapshot per outcome token every cycle, and activity/news on
+their configured cadences.  An interrupted run recorded bounded
+16-minute downtime gaps per market on restart — the gap-aware recovery
+path verified in production, not only in tests.
+
+After deriving `book_mid` market state from the accumulated snapshots
+and re-running the analysis (2,399 decisions, run `forward-pilot-1`),
+**19 of the 20 decisions inside the live-collection window drew their
+market-trend state from flow-independent mid prices** — the mechanism
+that will settle the contrarian-vs-bid-ask-bounce question once a
+multi-day run accumulates enough book history for the 1h/24h trend
+horizons.  All 20 window decisions resolved `ambiguous` at this data
+density, which is the conservative gating working as intended.

@@ -245,6 +245,48 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_collect_loop(args) -> int:
+    from polymarket.collection.forward import (
+        ForwardConfig,
+        default_cycle_printer,
+        run_loop,
+    )
+    from polymarket.contracts.schema import connect, init_db
+
+    if os.path.exists(args.db):
+        conn = connect(args.db)
+    else:
+        os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
+        conn = init_db(args.db, description="forward collection")
+    config = ForwardConfig(
+        condition_ids=tuple(args.condition_id),
+        interval_seconds=args.interval_minutes * 60.0,
+        activity_every=args.activity_every,
+        news_every=args.news_every,
+        activity_wallets=args.activity_wallets,
+        news_queries=tuple(args.news_query),
+        trade_pages_per_cycle=args.trade_pages,
+    )
+    duration = args.duration_hours * 3600.0 if args.duration_hours else None
+    print(
+        f"forward collection: {len(config.condition_ids)} markets, "
+        f"every {args.interval_minutes:g} min"
+        + (f", for {args.duration_hours:g}h" if duration else "")
+        + (f", {args.cycles} cycles" if args.cycles else "")
+        + " (Ctrl-C stops after the current cycle)"
+    )
+    state = run_loop(
+        conn, config, max_cycles=args.cycles,
+        duration_seconds=duration, on_cycle=default_cycle_printer,
+    )
+    print(
+        f"done: {state.cycle_index} cycles"
+        + (f", failures: {state.failures}" if state.failures else "")
+    )
+    conn.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="polymarket.cli",
@@ -285,6 +327,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "collect-loop",
+        help="forward collection: books/trades/status every N minutes",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--condition-id", action="append", required=True)
+    p.add_argument("--interval-minutes", type=float, default=5.0)
+    p.add_argument("--duration-hours", type=float, default=None)
+    p.add_argument("--cycles", type=int, default=None,
+                   help="stop after N cycles (useful for tests/smoke)")
+    p.add_argument("--activity-every", type=int, default=12)
+    p.add_argument("--news-every", type=int, default=12)
+    p.add_argument("--activity-wallets", type=int, default=30)
+    p.add_argument("--news-query", action="append", default=[])
+    p.add_argument("--trade-pages", type=int, default=5)
+    p.set_defaults(func=cmd_collect_loop)
 
     p = sub.add_parser("run-analysis", help="replay decisions and fit models")
     p.add_argument("--db", required=True)
