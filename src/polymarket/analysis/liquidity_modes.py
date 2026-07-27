@@ -43,12 +43,28 @@ import statistics
 import time
 from dataclasses import dataclass, field
 
-from polymarket.collection.canonical import canonical_json, namespace_id
+from polymarket.collection.canonical import canonical_json
 
-MODEL_VERSION = "liquidity-jump-1.0.0"
+MODEL_VERSION = "liquidity-jump-1.1.0"
 VARIABLES = ("spread_ticks", "turnover", "volatility", "best_book_size")
 LOG_EPS = 1e-9
 IQR_FLOOR = 1e-6
+# Turnover decomposes into PRESENCE (the binary indicator dimension)
+# and LEVEL GIVEN PRESENCE: reference stats for turnover are fitted on
+# positive-turnover bars only, and zero-turnover bars contribute level
+# z = 0.  Otherwise, in sparse markets where most five-minute bars
+# have no execution, presence-vs-absence dominates every distance and
+# a lone trade in calm conditions gets forced into event mode.
+# Minimum meaningful dispersion per variable, in TRANSFORM units — a
+# degenerate IQR falls back to these instead of a numerical epsilon:
+MIN_SCALE = {
+    "spread_ticks": 0.05,
+    "turnover": 1.0,        # log1p units: one unit ~ factor e
+    "volatility": 0.05,
+    "best_book_size": 0.05,
+}
+WINSOR_Z = 10.0
+TURNOVER_PRESENT_WEIGHT = 1.0  # binary 5th dimension
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,9 @@ class FittedJumpModel:
     train_bar_count: int
     config: JumpModelConfig
     assignments: dict[tuple[str, float], int] = field(default_factory=dict)
+    assignments_online: dict[tuple[str, float], int] = field(
+        default_factory=dict
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,62 +146,106 @@ def _utc_hour(bin_start: float) -> int:
     return int(bin_start // 3600) % 24
 
 
+def _log_transform(variable: str, value: float) -> float:
+    """Zero-aware transforms: turnover uses log1p (five-minute
+    prediction-market bars legitimately have zero executions, and
+    log(0+eps) would explode the standardized value when the IQR is
+    tiny); the strictly-positive variables keep log(x+eps)."""
+    if variable == "turnover":
+        return math.log1p(max(value, 0.0))
+    return math.log(value + LOG_EPS)
+
+
 def fit_reference_stats(
     train_bars: list[dict], config: JumpModelConfig
 ) -> dict:
-    """Median/IQR of log(x+eps) per (condition, UTC hour) cell, fitted
-    on TRAINING bars only; per-condition global fallback."""
+    """Median/IQR of transformed variables per (condition, UTC hour)
+    cell, fitted on TRAINING bars only; fallback chain: cell ->
+    per-condition global -> POOLED global (all conditions), so markets
+    absent from training still standardize instead of vanishing."""
     cells: dict[str, dict[str, list[float]]] = {}
     for bar in train_bars:
         cell = f"{bar['condition_id']}|{_utc_hour(bar['bin_start'])}"
         bucket = cells.setdefault(cell, {v: [] for v in VARIABLES})
         for variable in VARIABLES:
-            bucket[variable].append(math.log(bar[variable] + LOG_EPS))
+            if variable == "turnover" and bar[variable] <= 0:
+                continue  # level-given-presence: zeros excluded
+            bucket[variable].append(
+                _log_transform(variable, bar[variable])
+            )
     globals_: dict[str, dict[str, list[float]]] = {}
+    pooled: dict[str, list[float]] = {v: [] for v in VARIABLES}
     for bar in train_bars:
         bucket = globals_.setdefault(
             bar["condition_id"], {v: [] for v in VARIABLES}
         )
         for variable in VARIABLES:
-            bucket[variable].append(math.log(bar[variable] + LOG_EPS))
+            if variable == "turnover" and bar[variable] <= 0:
+                continue  # level-given-presence: zeros excluded
+            value = _log_transform(variable, bar[variable])
+            bucket[variable].append(value)
+            pooled[variable].append(value)
 
-    def summarize(values: list[float]) -> dict:
+    def summarize(values: list[float], variable: str) -> dict:
+        if not values:  # e.g. no traded bar in this cell
+            return {"median": 0.0, "iqr": MIN_SCALE.get(
+                variable, IQR_FLOOR), "n": 0, "iqr_floored": True}
         med = statistics.median(values)
         qs = statistics.quantiles(values, n=4) if len(values) >= 4 else None
         iqr = (qs[2] - qs[0]) if qs else 0.0
-        return {"median": med, "iqr": max(iqr, IQR_FLOOR),
-                "n": len(values), "iqr_floored": bool(iqr < IQR_FLOOR)}
+        floor = MIN_SCALE.get(variable, IQR_FLOOR)
+        return {"median": med, "iqr": max(iqr, floor),
+                "n": len(values), "iqr_floored": bool(iqr < floor)}
 
     stats = {
         "cells": {
-            cell: {v: summarize(vals[v]) for v in VARIABLES}
+            cell: {v: summarize(vals[v], v) for v in VARIABLES}
             for cell, vals in cells.items()
         },
         "globals": {
-            condition: {v: summarize(vals[v]) for v in VARIABLES}
+            condition: {v: summarize(vals[v], v) for v in VARIABLES}
             for condition, vals in globals_.items()
         },
+        "pooled": {v: summarize(pooled[v], v) for v in VARIABLES},
         "min_cell_observations": config.min_cell_observations,
         "log_eps": LOG_EPS,
+        "turnover_transform": "log1p_level_given_presence",
+        "min_scale": MIN_SCALE,
+        "winsor_z": WINSOR_Z,
     }
     return stats
 
 
 def stationarize(bar: dict, stats: dict, config: JumpModelConfig
                  ) -> tuple[float, ...] | None:
+    """Standardized vector, winsorized at +/- WINSOR_Z, with a binary
+    turnover-present indicator appended as the fifth dimension so
+    sparse turnover carries bounded, meaningful signal."""
     cell_key = f"{bar['condition_id']}|{_utc_hour(bar['bin_start'])}"
     cell = stats["cells"].get(cell_key)
-    fallback = stats["globals"].get(bar["condition_id"])
-    if fallback is None:
-        return None  # condition never seen in training
+    condition_global = stats["globals"].get(bar["condition_id"])
+    pooled = stats.get("pooled")
+    if condition_global is None and pooled is None:
+        return None
     out = []
     for variable in VARIABLES:
-        source = cell[variable] if (
-            cell is not None
-            and cell[variable]["n"] >= config.min_cell_observations
-        ) else fallback[variable]
-        value = math.log(bar[variable] + LOG_EPS)
-        out.append((value - source["median"]) / source["iqr"])
+        if variable == "turnover" and bar[variable] <= 0:
+            out.append(0.0)  # level undefined absent presence
+            continue
+        if (cell is not None
+                and cell[variable]["n"] >= config.min_cell_observations):
+            source = cell[variable]
+        elif (condition_global is not None
+              and condition_global[variable]["n"] > 0):
+            source = condition_global[variable]
+        else:
+            source = pooled[variable]
+        value = _log_transform(variable, bar[variable])
+        z = (value - source["median"]) / source["iqr"]
+        out.append(max(-WINSOR_Z, min(WINSOR_Z, z)))
+    out.append(
+        TURNOVER_PRESENT_WEIGHT if bar["turnover"] > 0 else 0.0
+    )
     return tuple(out)
 
 
@@ -191,6 +254,32 @@ def stationarize(bar: dict, stats: dict, config: JumpModelConfig
 # ---------------------------------------------------------------------------
 def _sq_dist(x: tuple[float, ...], theta: list[float]) -> float:
     return sum((a - b) ** 2 for a, b in zip(x, theta))
+
+
+def online_assign(
+    X: list[tuple[float, ...]],
+    centroids: list[list[float]],
+    lam: float,
+) -> list[int]:
+    """ONLINE (filtered) mode sequence: the mode at t uses observations
+    only through t — the forward pass of the DP, with m_t taken as the
+    argmin of the forward cost at t.  No backtracking from the future,
+    so an assignment claimed available at the end of bin t truly was."""
+    if not X:
+        return []
+    K = len(centroids)
+    forward = [_sq_dist(X[0], centroids[k]) for k in range(K)]
+    modes = [min(range(K), key=lambda k: forward[k])]
+    for t in range(1, len(X)):
+        forward = [
+            min(
+                forward[j] + (0.0 if j == k else lam)
+                for j in range(K)
+            ) + _sq_dist(X[t], centroids[k])
+            for k in range(K)
+        ]
+        modes.append(min(range(K), key=lambda k: forward[k]))
+    return modes
 
 
 def dp_assign(
@@ -246,6 +335,8 @@ def _volatility_split_init(
     X: list[tuple[float, ...]]
 ) -> list[list[float]]:
     sigma_index = VARIABLES.index("volatility")
+    # dimensionality follows the data (stationarized vectors carry the
+    # turnover-present indicator as an extra component)
     ranked = sorted(X, key=lambda x: x[sigma_index])
     half = max(1, len(ranked) // 2)
     lower, upper = ranked[:half], ranked[half:] or ranked[-1:]
@@ -378,10 +469,27 @@ def fit_jump_model(
     calm_mode = min(
         (0, 1), key=lambda k: centroids[k][sigma_index]
     )
-    mode_run_id = namespace_id(
-        "liquidity-modes", fit_cutoff, config.bin_seconds, lam,
-        MODEL_VERSION, canonical_json(stats)[:64],
-    )
+    import hashlib
+
+    train_identity = [
+        (bar["condition_id"], bar["bin_start"]) for bar in train_bars
+    ]
+    fingerprint = hashlib.sha256(canonical_json({
+        "reference_stats": stats,
+        "config": {
+            "bin_seconds": config.bin_seconds,
+            "lambda": lam,
+            "lambda_candidates": list(config.lambda_candidates),
+            "min_mean_duration_bins": config.min_mean_duration_bins,
+            "min_cell_observations": config.min_cell_observations,
+            "max_iterations": config.max_iterations,
+        },
+        "model_version": MODEL_VERSION,
+        "variables": list(VARIABLES),
+        "train_bars": train_identity,
+        "fit_cutoff": fit_cutoff,
+    }).encode()).hexdigest()
+    mode_run_id = f"modes-{fingerprint[:32]}"
     model = FittedJumpModel(
         mode_run_id=mode_run_id, centroids=centroids,
         calm_mode=calm_mode, lambda_penalty=lam,
@@ -392,10 +500,12 @@ def fit_jump_model(
     all_bars = _load_raw_bars(conn, config)
     segments, segment_bars = _contiguous_segments(all_bars, stats, config)
     for xs, bars in zip(segments, segment_bars):
-        for bar, mode in zip(bars, dp_assign(xs, centroids, lam)):
-            model.assignments[
-                (bar["condition_id"], bar["bin_start"])
-            ] = mode
+        smoothed = dp_assign(xs, centroids, lam)
+        filtered = online_assign(xs, centroids, lam)
+        for bar, mode_s, mode_o in zip(bars, smoothed, filtered):
+            key = (bar["condition_id"], bar["bin_start"])
+            model.assignments[key] = mode_s
+            model.assignments_online[key] = mode_o
     return model
 
 
@@ -429,17 +539,22 @@ def persist_jump_model(
             MODEL_VERSION, now,
         ),
     )
-    for (condition_id, bin_start), mode in model.assignments.items():
-        label = "calm" if mode == model.calm_mode else "event"
+    for key, mode in model.assignments.items():
+        condition_id, bin_start = key
+        mode_online = model.assignments_online[key]
         conn.execute(
             """
             INSERT OR REPLACE INTO liquidity_mode_assignments
                 (mode_run_id, condition_id, bin_start, mode, mode_label,
-                 in_training, assigned_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 mode_online, mode_label_online, in_training,
+                 assigned_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                model.mode_run_id, condition_id, bin_start, mode, label,
+                model.mode_run_id, condition_id, bin_start,
+                mode, "calm" if mode == model.calm_mode else "event",
+                mode_online,
+                "calm" if mode_online == model.calm_mode else "event",
                 int(bin_start < fit_cutoff), now,
             ),
         )

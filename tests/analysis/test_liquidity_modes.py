@@ -181,8 +181,11 @@ def test_stationarization_fitted_on_training_only():
     x = stationarize(later, stats, JumpModelConfig())
     assert x is not None
     assert x[VARIABLES.index("turnover")] > 0     # z-scored vs TRAIN medians
+    # a condition absent from training standardizes via POOLED stats
     unknown = dict(later, condition_id="0xother")
-    assert stationarize(unknown, stats, JumpModelConfig()) is None
+    transferred = stationarize(unknown, stats, JumpModelConfig())
+    assert transferred is not None
+    assert all(abs(z) <= 10.0 for z in transferred[:-1])  # winsorized
 
 
 def test_incomplete_bars_break_dp_chains(conn):
@@ -234,7 +237,10 @@ def test_persist_and_reload_round_trip(conn):
 
 # ---------------------------------------------------------------------------
 def _news_family(conn, family_id, news_time, market_id="m-jump"):
+    """A family with ONE claim arriving at news_time (the screening
+    unit is the claim x market)."""
     now = time.time()
+    claim_id = f"claim-{family_id}"
     conn.execute(
         "INSERT OR IGNORE INTO markets (market_id, condition_id, "
         "question, raw_response_id, raw_record_index, raw_record_hash, "
@@ -242,18 +248,42 @@ def _news_family(conn, family_id, news_time, market_id="m-jump"):
         "(?, ?, 'Q?', 1, 0, 'h', 'p', 2, ?)", (market_id, COND, now),
     )
     conn.execute(
+        "INSERT OR IGNORE INTO news_articles (article_id, source_id, "
+        "source_url, source_published_at, first_observed_at, "
+        "download_completed_at, timestamp_source, timestamp_confidence, "
+        "headline, body, content_hash, raw_response_id, "
+        "raw_record_index, raw_record_hash, parser_version, "
+        "schema_version, normalized_at) VALUES (?, 's', 'u', ?, ?, ?, "
+        "'feed', 0.8, ?, ?, ?, 1, 0, 'h', 'p', 2, ?)",
+        (f"art-{family_id}", news_time, news_time, news_time,
+         family_id, family_id, f"ch-{family_id}", now),
+    )
+    conn.execute(
+        "INSERT INTO news_claims (claim_id, article_id, claim_text, "
+        "entities_json, quantities_json, first_available_at, "
+        "extractor_version, confidence) VALUES (?, ?, ?, '[]', '[]', "
+        "?, 'x', 0.9)",
+        (claim_id, f"art-{family_id}", family_id, news_time),
+    )
+    conn.execute(
         "INSERT INTO event_families (event_family_id, label, "
         "earliest_available_at, created_by, created_at) VALUES "
         "(?, ?, ?, 't', ?)", (family_id, family_id, news_time, now),
+    )
+    conn.execute(
+        "INSERT INTO claim_edges (edge_id, claim_id, event_family_id, "
+        "edge_type, effective_from, evidence, confidence) VALUES "
+        "(?, ?, ?, 'new', ?, 'k', 0.5)",
+        (f"edge-{family_id}", claim_id, family_id, news_time),
     )
     conn.execute(
         "INSERT INTO relevance_judgments (relevance_judgment_id, "
         "claim_id, event_family_id, market_id, contract_version_seq, "
         "source_effective_at, scored_at, computed_at, rel_class, "
         "rel_score, direction, method, model_version) VALUES "
-        "(?, 'c', ?, ?, 1, ?, ?, ?, 'background', 0.3, 0.0, 'rule', 'v')",
-        (f"rj-{family_id}", family_id, market_id, news_time, now,
-         news_time),
+        "(?, ?, ?, ?, 1, ?, ?, ?, 'background', 0.3, 0.0, 'rule', 'v')",
+        (f"rj-{family_id}", claim_id, family_id, market_id, news_time,
+         now, news_time),
     )
     conn.commit()
 
@@ -353,3 +383,142 @@ def test_missing_neighbor_bins_mark_insufficient_coverage(conn):
 
 def test_math_sanity_volatility_from_variance():
     assert math.isclose(math.sqrt(0.0004), 0.02)
+
+
+def test_online_decoder_never_uses_future_bars():
+    """The filtered mode at t must be identical whatever happens after
+    t — the property the availability claim rests on."""
+    from polymarket.analysis.liquidity_modes import online_assign
+
+    rng = random.Random(11)
+    X = [tuple(rng.uniform(-2, 2) for _ in range(5)) for _ in range(30)]
+    centroids = [[-1.0] * 5, [1.0] * 5]
+    full = online_assign(X, centroids, 2.0)
+    for t in (1, 7, 15, 29):
+        prefix = online_assign(X[:t], centroids, 2.0)
+        assert prefix == full[:t]           # future never leaks backward
+    # while the SMOOTHED decoder is allowed to differ on prefixes
+    smoothed_full = dp_assign(X, centroids, 2.0)
+    assert len(smoothed_full) == len(X)
+
+
+def test_online_and_smoothed_assignments_both_persisted(conn):
+    _regime_world(conn)
+    model = _fitted(conn)
+    row = conn.execute(
+        "SELECT mode, mode_online, mode_label, mode_label_online "
+        "FROM liquidity_mode_assignments WHERE mode_run_id = ? LIMIT 1",
+        (model.mode_run_id,),
+    ).fetchone()
+    assert row["mode_label"] in ("calm", "event")
+    assert row["mode_label_online"] in ("calm", "event")
+
+
+def test_sparse_turnover_does_not_explode(conn):
+    """90% zero-turnover bars with a genuine volatility event window:
+    the zero-aware transform + presence indicator must keep turnover
+    z-scores bounded, and turnover sparsity must not override the
+    volatility signal — the reviewer's dominant-distance failure mode."""
+    rng = random.Random(21)
+    for i in range(200):
+        in_event = 150 <= i < 160
+        traded = in_event or rng.random() < 0.1
+        _insert_bar(
+            conn, COND, T0 + i * BIN,
+            spread_ticks=rng.uniform(1.0, 1.4) * (2.0 if in_event else 1),
+            turnover=rng.uniform(50, 150) if traded else 0.0,
+            volatility=rng.uniform(0.008, 0.012) * (6 if in_event else 1),
+            best_size=rng.uniform(180, 220),
+        )
+    conn.commit()
+    model = fit_jump_model(
+        conn, fit_cutoff=T0 + 500 * BIN,
+        config=JumpModelConfig(fixed_lambda=1.0),
+    )
+    from polymarket.analysis.liquidity_modes import (
+        _load_raw_bars,
+        stationarize,
+    )
+
+    bars = _load_raw_bars(conn, JumpModelConfig())
+    zs = [
+        stationarize(bar, model.reference_stats, model.config)
+        for bar in bars
+    ]
+    turnover_index = VARIABLES.index("turnover")
+    assert all(abs(z[turnover_index]) <= 10.0 for z in zs if z)
+    labels = {
+        bin_start: ("calm" if m == model.calm_mode else "event")
+        for (_, bin_start), m in model.assignments.items()
+    }
+    # the volatility event window is recovered ...
+    event_hits = sum(
+        1 for i in range(150, 160)
+        if labels.get(T0 + i * BIN) == "event"
+    )
+    assert event_hits >= 8
+    # ... and QUIET zero-turnover bars are NOT dragged into event mode
+    # by turnover presence/absence alone
+    calm_zone = [labels[T0 + i * BIN] for i in range(0, 140)
+                 if T0 + i * BIN in labels]
+    assert calm_zone.count("calm") / len(calm_zone) > 0.9
+
+
+def test_transfer_to_market_absent_from_training(conn):
+    _regime_world(conn, condition_id=COND)
+    # a NEW market appears only after the fit cutoff
+    for i in range(20):
+        _insert_bar(
+            conn, "0xnew", T0 + 600 * BIN + i * BIN,
+            spread_ticks=1.2, turnover=100.0, volatility=0.01,
+            best_size=200.0,
+        )
+    conn.commit()
+    model = fit_jump_model(
+        conn, fit_cutoff=T0 + 500 * BIN,
+        config=JumpModelConfig(fixed_lambda=1.0),
+    )
+    new_market = [
+        key for key in model.assignments if key[0] == "0xnew"
+    ]
+    assert len(new_market) == 20            # pooled fallback transfers
+
+
+def test_screen_basis_online_vs_retrospective_rows(conn):
+    _regime_world(conn, event_windows=((100, 112),))
+    model = _fitted(conn)
+    _news_family(conn, "fam-basis", T0 + 100 * BIN + 42)
+    a = screen_news_impact(
+        conn, model.mode_run_id, assignment_basis="online_filtered"
+    )
+    b = screen_news_impact(
+        conn, model.mode_run_id,
+        assignment_basis="retrospective_smoothed",
+    )
+    assert a["assignment_basis"] == "online_filtered"
+    assert b["assignment_basis"] == "retrospective_smoothed"
+    bases = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT assignment_basis FROM news_impact_screens"
+        )
+    }
+    assert bases == {"online_filtered", "retrospective_smoothed"}
+    with pytest.raises(ValueError):
+        screen_news_impact(conn, model.mode_run_id, "whenever")
+
+
+def test_asof_accessor_filters_by_basis(conn):
+    _regime_world(conn, event_windows=((100, 112),))
+    model = _fitted(conn)
+    _news_family(conn, "fam-asof", T0 + 100 * BIN + 42)
+    screen_news_impact(
+        conn, model.mode_run_id,
+        assignment_basis="retrospective_smoothed",
+    )
+    cutoff = T0 + 200 * BIN
+    online_rows = impactful_news_asof(
+        conn, COND, cutoff, model.mode_run_id
+    )
+    assert online_rows == []                # no online screens exist yet
+    screen_news_impact(conn, model.mode_run_id)
+    assert impactful_news_asof(conn, COND, cutoff, model.mode_run_id)

@@ -418,6 +418,10 @@ DDL: list[str] = [
         bin_start REAL NOT NULL,
         mode INTEGER NOT NULL,
         mode_label TEXT NOT NULL CHECK (mode_label IN ('calm', 'event')),
+        mode_online INTEGER NOT NULL,
+        mode_label_online TEXT NOT NULL CHECK (
+            mode_label_online IN ('calm', 'event')
+        ),
         in_training INTEGER NOT NULL,
         assigned_at REAL NOT NULL,
         PRIMARY KEY (mode_run_id, condition_id, bin_start)
@@ -426,8 +430,13 @@ DDL: list[str] = [
     """
     CREATE TABLE IF NOT EXISTS news_impact_screens (
         mode_run_id TEXT NOT NULL,
-        event_family_id TEXT NOT NULL,
+        claim_id TEXT NOT NULL,
+        event_family_id TEXT,
         condition_id TEXT NOT NULL,
+        assignment_basis TEXT NOT NULL CHECK (
+            assignment_basis IN ('online_filtered',
+                                 'retrospective_smoothed')
+        ),
         news_time REAL NOT NULL,
         arrival_bin_start REAL NOT NULL,
         pre_mode_label TEXT,
@@ -441,7 +450,8 @@ DDL: list[str] = [
         screen_available_at REAL NOT NULL,
         screen_model_version TEXT NOT NULL,
         created_at REAL NOT NULL,
-        PRIMARY KEY (mode_run_id, event_family_id, condition_id)
+        PRIMARY KEY (mode_run_id, claim_id, condition_id,
+                     assignment_basis)
     );
     """,
     """
@@ -571,6 +581,16 @@ _PAPER_COLUMNS = {
         ("book_coverage_fraction", "REAL"),
         ("blocking_gap", "INTEGER NOT NULL DEFAULT 0"),
     ),
+    "liquidity_mode_assignments": (
+        ("mode_online", "INTEGER NOT NULL DEFAULT 0"),
+        ("mode_label_online", "TEXT NOT NULL DEFAULT 'calm'"),
+    ),
+}
+
+_REBUILD_IF_MISSING_COLUMN = {
+    # PR-8-shaped screens lack claim-level identity; the table is
+    # rebuilt (screens are derived data, recomputable from a mode run)
+    "news_impact_screens": "claim_id",
 }
 
 
@@ -604,6 +624,16 @@ def ensure_paper_schema(conn: sqlite3.Connection) -> list[str]:
             if f"CREATE TABLE IF NOT EXISTS {table} " in statement:
                 conn.executescript(statement)
                 applied.append(table)
+    for table, marker in _REBUILD_IF_MISSING_COLUMN.items():
+        columns = {
+            r[1] for r in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if columns and marker not in columns:
+            conn.execute(f"DROP TABLE {table}")  # derived, recomputable
+            for statement in DDL:
+                if f"CREATE TABLE IF NOT EXISTS {table} " in statement:
+                    conn.executescript(statement)
+            applied.append(f"{table}:rebuilt")
     rj_columns = {
         r[1] for r in conn.execute("PRAGMA table_info(relevance_judgments)")
     }
