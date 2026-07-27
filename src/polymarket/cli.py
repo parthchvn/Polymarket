@@ -245,6 +245,73 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fit_liquidity_modes(args) -> int:
+    import json as _json
+    import time as _time
+
+    from polymarket.analysis.liquidity_modes import (
+        JumpModelConfig,
+        fit_jump_model,
+        persist_jump_model,
+    )
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    fit_cutoff = args.fit_cutoff or _time.time()
+    config = JumpModelConfig(
+        bin_seconds=args.bin_seconds,
+        fixed_lambda=args.fixed_lambda,
+    )
+    try:
+        model = fit_jump_model(conn, fit_cutoff=fit_cutoff, config=config)
+    except ValueError as exc:
+        print(f"cannot fit: {exc}")
+        conn.close()
+        return 1
+    persist_jump_model(conn, model, fit_cutoff)
+    labels = {}
+    for (_, _), mode in model.assignments.items():
+        label = "calm" if mode == model.calm_mode else "event"
+        labels[label] = labels.get(label, 0) + 1
+    print(_json.dumps({
+        "mode_run_id": model.mode_run_id,
+        "lambda": model.lambda_penalty,
+        "lambda_selection": model.lambda_selection,
+        "train_bars": model.train_bar_count,
+        "assigned_bars": len(model.assignments),
+        "mode_counts": labels,
+        "centroids": model.centroids,
+        "calm_mode": model.calm_mode,
+    }, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
+def cmd_screen_news_impact(args) -> int:
+    import json as _json
+
+    from polymarket.analysis.news_impact_screen import screen_news_impact
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    mode_run_id = args.mode_run_id
+    if mode_run_id is None:
+        row = conn.execute(
+            "SELECT mode_run_id FROM liquidity_mode_runs "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            print("no fitted mode runs; run fit-liquidity-modes first")
+            return 1
+        mode_run_id = row[0]
+    counters = screen_news_impact(conn, mode_run_id)
+    print(_json.dumps(counters, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
 def cmd_build_liquidity_bars(args) -> int:
     from polymarket.analysis.liquidity_bars import (
         LiquidityBarConfig,
@@ -415,6 +482,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "fit-liquidity-modes",
+        help="fit the two-state liquidity jump model (paper section 3)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--bin-seconds", type=float, default=300.0)
+    p.add_argument("--fit-cutoff", type=float, default=None,
+                   help="train on bars strictly before this epoch "
+                        "(default: now)")
+    p.add_argument("--fixed-lambda", type=float, default=None,
+                   help="skip persistence-target selection")
+    p.set_defaults(func=cmd_fit_liquidity_modes)
+
+    p = sub.add_parser(
+        "screen-news-impact",
+        help="calm->event news impact screen (paper section 4)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--mode-run-id", default=None,
+                   help="default: the most recent fitted run")
+    p.set_defaults(func=cmd_screen_news_impact)
 
     p = sub.add_parser(
         "build-liquidity-bars",

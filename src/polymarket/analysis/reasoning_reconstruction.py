@@ -251,7 +251,10 @@ def _occurrence_reconstruction(
     features = []
     evidence_by_id: dict[str, list[dict]] = {}
     for opportunity in opportunities:
-        context = build_context(reader, opportunity.episode)
+        context = build_context(
+            reader, opportunity.episode,
+            relevance_availability="retrospective_source",
+        )
         features.append(compute_features(context, opportunity.episode))
         evidence_by_id[opportunity.episode.decision_id] = news_evidence(
             context

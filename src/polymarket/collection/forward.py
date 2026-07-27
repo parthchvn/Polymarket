@@ -105,25 +105,38 @@ def derive_trade_cursor(conn) -> float | None:
 
 
 def derive_surface_cursor(
-    conn, collectors: tuple[str, ...]
+    conn, collectors: tuple[str, ...], require_all: bool = False
 ) -> float | None:
-    """Newest stored response time across the given collectors."""
-    placeholders = ",".join("?" for _ in collectors)
-    row = conn.execute(
-        f"SELECT MAX(received_at) FROM raw_responses "
-        f"WHERE collector IN ({placeholders})",
-        collectors,
-    ).fetchone()
-    return row[0]
+    """Last-SUCCESS cursor across collectors (2xx responses only).
+
+    ``require_all=False``: newest successful response across the set.
+    ``require_all=True``: the OLDER of each collector's own newest
+    success — used for the trade surface, where role reconciliation
+    needs BOTH the taker and expanded feeds, so a fresh taker response
+    must not hide a stale expanded feed."""
+    cursors: list[float] = []
+    for collector in collectors:
+        row = conn.execute(
+            "SELECT MAX(received_at) FROM raw_responses "
+            "WHERE collector = ? AND http_status BETWEEN 200 AND 299",
+            (collector,),
+        ).fetchone()
+        if row[0] is not None:
+            cursors.append(row[0])
+        elif require_all:
+            return None
+    if not cursors:
+        return None
+    return min(cursors) if require_all else max(cursors)
 
 
-# gap surface -> (collectors that feed it, cadence attribute)
-_SURFACE_CURSORS: dict[str, tuple[tuple[str, ...], str]] = {
-    "trades": (("trades_taker", "trades_expanded"), "trade_every"),
-    "books": (("books",), "book_every"),
-    "markets": (("markets",), "market_every"),
-    "news": (("news:google-rss",), "news_every_seconds"),
-    "activity": (("activity",), "activity_every_seconds"),
+# gap surface -> (collectors, cadence attribute, require_all)
+_SURFACE_CURSORS: dict[str, tuple[tuple[str, ...], str, bool]] = {
+    "trades": (("trades_taker", "trades_expanded"), "trade_every", True),
+    "books": (("books",), "book_every", False),
+    "markets": (("markets",), "market_every", False),
+    "news": (("news:google-rss",), "news_every_seconds", False),
+    "activity": (("activity",), "activity_every_seconds", False),
 }
 
 
@@ -133,8 +146,9 @@ def record_downtime_gaps(conn, config: ForwardConfig, now: float) -> int:
     60 seconds ago must not inherit a gap because trades last ran five
     minutes ago — and vice versa."""
     recorded = 0
-    for surface, (collectors, cadence_attr) in _SURFACE_CURSORS.items():
-        last = derive_surface_cursor(conn, collectors)
+    for surface, (collectors, cadence_attr,
+                  require_all) in _SURFACE_CURSORS.items():
+        last = derive_surface_cursor(conn, collectors, require_all)
         if last is None:
             continue
         cadence = float(getattr(config, cadence_attr))

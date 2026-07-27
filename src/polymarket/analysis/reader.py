@@ -266,8 +266,21 @@ class SQLiteNormalizedReader:
         method: str | None = None,
         model_version: str | None = None,
         allow_version_fallback: bool = True,
+        availability_policy: str = "online_scored",
     ) -> tuple[list[sqlite3.Row], bool]:
         """Exactly one judgment per event family, strictly before cutoff.
+
+        Availability policy — what "before cutoff" means for a judgment:
+
+        * ``online_scored`` (default, live DRC reconstruction): the
+          underlying text was available AND the scorer had actually run
+          before the cutoff (``scored_at < cutoff`` when recorded).  A
+          rescored LLM judgment did not exist until it was computed;
+          online claims must not pretend otherwise.
+        * ``retrospective_source``: text availability alone
+          (``computed_at < cutoff``) — for clearly labelled paper
+          replications and backtests with frozen scorers over
+          pre-decision text.
 
         Primary rule: only judgments computed against the contract version
         active at the decision are eligible (obsolete contract-version
@@ -287,6 +300,18 @@ class SQLiteNormalizedReader:
         Returns (rows, used_version_fallback).
         """
 
+        if availability_policy not in (
+            "online_scored", "retrospective_source"
+        ):
+            raise ValueError(
+                f"unknown availability policy: {availability_policy}"
+            )
+        availability = ""
+        if availability_policy == "online_scored":
+            # legacy rows carry scored_at == computed_at (migration);
+            # NULL means pre-migration provenance and stays eligible
+            availability = " AND (scored_at IS NULL OR scored_at < ?)"
+
         def query(version_clause: str, version_args: list) -> list[sqlite3.Row]:
             extra = ""
             extra_args: list = []
@@ -302,6 +327,7 @@ class SQLiteNormalizedReader:
             sql = f"""
                 SELECT r.* FROM relevance_judgments r
                 WHERE r.market_id = ? AND r.computed_at < ?
+                  {availability.replace('scored_at', 'r.scored_at')}
                   {version_clause.replace('contract_version_seq',
                                           'r.contract_version_seq')}
                   {extra.replace('method', 'r.method').replace(
@@ -310,15 +336,20 @@ class SQLiteNormalizedReader:
                       SELECT MAX(r2.computed_at) FROM relevance_judgments r2
                       WHERE r2.event_family_id = r.event_family_id
                         AND r2.market_id = r.market_id AND r2.computed_at < ?
+                        {availability.replace('scored_at', 'r2.scored_at')}
                         {version_clause.replace('contract_version_seq',
                                                 'r2.contract_version_seq')}
                         {inner_extra}
                   )
                 ORDER BY r.event_family_id
             """
+            availability_args = (
+                [cutoff] if availability else []
+            )
             args = (
-                [market_id, cutoff] + version_args + extra_args
-                + [cutoff] + version_args + extra_args
+                [market_id, cutoff] + availability_args + version_args
+                + extra_args + [cutoff] + availability_args
+                + version_args + extra_args
             )
             return self._conn.execute(sql, args).fetchall()
 

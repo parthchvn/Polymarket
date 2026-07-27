@@ -179,6 +179,20 @@ def build_liquidity_bars(
         return sum(values) / len(values) if values else None
 
     previous_close: float | None = None
+    if positive:
+        seed_row = conn.execute(
+            """
+            SELECT best_bid, best_ask FROM order_book_snapshots
+            WHERE asset = ? AND observed_at < ?
+              AND best_bid IS NOT NULL AND best_ask IS NOT NULL
+            ORDER BY observed_at DESC LIMIT 1
+            """,
+            (positive[0], first_bin),
+        ).fetchone()
+        if seed_row is not None:
+            previous_close = logit(
+                (seed_row[0] + seed_row[1]) / 2.0, config.logit_clip
+            )
     for bin_start in sorted(bins):
         bucket = bins[bin_start]
         bin_end = bin_start + config.bin_seconds

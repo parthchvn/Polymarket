@@ -294,6 +294,8 @@ ARTICLE BODY:
 class OllamaRelevanceScorer:
     """Compare an extracted claim with exact market resolution semantics."""
 
+    method = "ollama_llm"
+
     def __init__(self, model: str = "qwen3:8b") -> None:
         self.model = model
         self.version = f"ollama-{model}-relevance-v1"
