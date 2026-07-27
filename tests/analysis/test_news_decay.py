@@ -184,7 +184,7 @@ def test_decay_features_on_synthetic_world(synthetic_db_path):
     for episode in episodes:
         if episode.direction is None:
             continue
-        context = build_context(reader, episode)
+        context = build_context(reader, episode, relevance_availability="retrospective_source")
         by_key[(episode.actor_id, episode.anchor_time)] = compute_features(
             context, episode
         )

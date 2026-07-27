@@ -24,7 +24,7 @@ def _episode_features(synthetic_db_path):
     for episode in episodes:
         if episode.direction is None:
             continue
-        context = build_context(reader, episode)
+        context = build_context(reader, episode, relevance_availability="retrospective_source")
         out.append((episode, context, compute_features(context, episode)))
     return out
 

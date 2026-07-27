@@ -294,3 +294,88 @@ def test_realized_variance_seeded_with_previous_close(conn):
     ).fetchone()[0]
     jump = (logit(0.50) - logit(0.42)) ** 2
     assert rv2 == pytest.approx(jump)             # first return retained
+
+
+def test_incremental_rebuild_equals_full_rebuild(conn):
+    """The incremental path must seed realized variance with the last
+    pre-window midquote — bars must be byte-identical to a rebuild."""
+    for i, (bid, ask) in enumerate(
+        [(0.40, 0.44), (0.41, 0.45), (0.42, 0.46), (0.43, 0.47),
+         (0.44, 0.48), (0.48, 0.52), (0.49, 0.53), (0.50, 0.54),
+         (0.51, 0.55), (0.52, 0.56)]
+    ):
+        _book(conn, T0 + 150 * i, bid, ask)     # spans 5 bins
+    conn.commit()
+    build_liquidity_bars(conn, COND)            # full build
+    full = [tuple(r) for r in conn.execute(
+        "SELECT bin_start, logit_open, logit_close, realized_variance, "
+        "feature_version FROM liquidity_bars ORDER BY bin_start"
+    )]
+    # wipe and rebuild incrementally: first bins, then the CLI-style
+    # resume from the last existing bin_start
+    conn.execute("DELETE FROM liquidity_bars")
+    conn.commit()
+    build_liquidity_bars(conn, COND, end=T0 + 600.0)
+    last = conn.execute(
+        "SELECT MAX(bin_start) FROM liquidity_bars"
+    ).fetchone()[0]
+    build_liquidity_bars(conn, COND, start=last)
+    incremental = [tuple(r) for r in conn.execute(
+        "SELECT bin_start, logit_open, logit_close, realized_variance, "
+        "feature_version FROM liquidity_bars ORDER BY bin_start"
+    )]
+    assert incremental == full
+
+
+def test_relevance_availability_policy(conn):
+    """online_scored excludes judgments whose scorer ran after the
+    cutoff; retrospective_source includes them."""
+    import time as _time
+
+    now = _time.time()
+    conn.execute(
+        "INSERT INTO markets (market_id, condition_id, question, "
+        "raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-a', ?, 'Q?', 1, 0, 'h', 'p', 2, ?)", (COND, now),
+    )
+    decision_time = 1_000_000.0
+    rows = [
+        # scored BEFORE the decision: visible under both policies
+        ("rj-early", "fam-early", decision_time - 500,
+         decision_time - 400),
+        # text available before, scorer ran AFTER (backfilled LLM)
+        ("rj-late", "fam-late", decision_time - 500,
+         decision_time + 5000),
+    ]
+    for judgment_id, family, computed_at, scored_at in rows:
+        conn.execute(
+            "INSERT INTO event_families (event_family_id, label, "
+            "earliest_available_at, created_by, created_at) VALUES "
+            "(?, ?, ?, 't', ?)", (family, family, computed_at, now),
+        )
+        conn.execute(
+            "INSERT INTO relevance_judgments (relevance_judgment_id, "
+            "claim_id, event_family_id, market_id, "
+            "contract_version_seq, source_effective_at, scored_at, "
+            "computed_at, rel_class, rel_score, direction, method, "
+            "model_version) VALUES (?, 'c', ?, 'm-a', 1, ?, ?, ?, "
+            "'background', 0.3, 0.0, 'x', 'v')",
+            (judgment_id, family, computed_at, scored_at, computed_at),
+        )
+    conn.commit()
+    reader = SQLiteNormalizedReader(conn)
+    online, _ = reader.relevance_snapshot_asof(
+        "m-a", 1, decision_time, availability_policy="online_scored"
+    )
+    retro, _ = reader.relevance_snapshot_asof(
+        "m-a", 1, decision_time,
+        availability_policy="retrospective_source",
+    )
+    assert {r["event_family_id"] for r in online} == {"fam-early"}
+    assert {r["event_family_id"] for r in retro} \
+        == {"fam-early", "fam-late"}
+    with pytest.raises(ValueError):
+        reader.relevance_snapshot_asof(
+            "m-a", 1, decision_time, availability_policy="whenever"
+        )

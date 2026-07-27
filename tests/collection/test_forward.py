@@ -134,13 +134,13 @@ def test_third_cycle_after_failure_continues(conn):
     ).fetchone()[0] == len(CONDITIONS)               # only the failed cycle
 
 
-def _store_response(conn, collector, received_at):
+def _store_response(conn, collector, received_at, http_status=200):
     run_id = start_collector_run(conn, collector, {"t": received_at})
     insert_raw_response(
         conn, collector_run_id=run_id, collector=collector,
         base_url="stub://", endpoint="x", params={"t": received_at},
         requested_at=received_at - 1, received_at=received_at,
-        http_status=200, headers={}, payload=b"[]",
+        http_status=http_status, headers={}, payload=b"[]",
     )
     finish_collector_run(conn, run_id, "succeeded")
 
@@ -160,9 +160,11 @@ def test_downtime_gaps_are_surface_specific(conn):
     config = _config(book_every=60.0, trade_every=300.0)
     now = 2_000_000.0
     assert record_downtime_gaps(conn, config, now) == 0  # fresh db
-    # books were healthy 90s ago (within 2x60s); trades stale by 20 min
+    # books healthy 90s ago; taker FRESH but expanded stale 20 min:
+    # a fresh taker response must NOT hide the stale expanded feed
     _store_response(conn, "books", now - 90.0)
-    _store_response(conn, "trades_taker", now - 1200.0)
+    _store_response(conn, "trades_taker", now - 30.0)
+    _store_response(conn, "trades_expanded", now - 1200.0)
     recorded = record_downtime_gaps(conn, config, now)
     assert recorded == len(CONDITIONS)                   # trades only
     gaps = conn.execute(
@@ -171,18 +173,21 @@ def test_downtime_gaps_are_surface_specific(conn):
     assert {g[0] for g in gaps} == {"trades"}            # books untouched
     assert all(
         g[1] == now - 1200.0 and g[2] == now for g in gaps
-    )                                                    # OWN cursor
-    # both stale: both surfaces gap, each from its own cursor
+    )                                                    # OLDER cursor
+    # both stale: both surfaces gap, each from its own cursor; failed
+    # (non-2xx) responses never advance a cursor
     conn.execute("DELETE FROM collector_gaps")
     conn.execute("DELETE FROM raw_responses")
     conn.commit()
     _store_response(conn, "books", now - 400.0)          # > 2x60s
-    _store_response(conn, "trades_taker", now - 1200.0)  # > 2x300s
+    _store_response(conn, "trades_taker", now - 1200.0)
+    _store_response(conn, "trades_expanded", now - 1300.0)
+    _store_response(conn, "books", now - 30.0, http_status=503)
     record_downtime_gaps(conn, config, now)
     starts = dict(conn.execute(
         "SELECT surface, MIN(gap_start) FROM collector_gaps GROUP BY 1"
     ).fetchall())
-    assert starts == {"books": now - 400.0, "trades": now - 1200.0}
+    assert starts == {"books": now - 400.0, "trades": now - 1300.0}
 
 
 def test_run_loop_respects_max_cycles_without_sleeping(conn):

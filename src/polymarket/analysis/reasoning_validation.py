@@ -74,7 +74,10 @@ def _world_dataset(seed: int, workdir: str) -> dict[str, Any]:
     labeled = [e for e in episodes if e.direction is not None]
     rows: list[dict[str, Any]] = []
     for episode in labeled:
-        context = build_context(reader, episode)
+        context = build_context(
+            reader, episode,
+            relevance_availability="retrospective_source",
+        )
         features = compute_features(context, episode)
         rows.append({
             "episode": episode,
@@ -337,7 +340,10 @@ def _occurrence_summary(world, model, versions, records) -> dict[str, Any]:
     labels = occurrence_labels(opportunities)
     features = []
     for opportunity in opportunities:
-        context = build_context(reader, opportunity.episode)
+        context = build_context(
+            reader, opportunity.episode,
+            relevance_availability="retrospective_source",
+        )
         features.append(compute_features(context, opportunity.episode))
     X = np.asarray(
         [[f[n] for n in ATTRIBUTION_FEATURES] for f in features], dtype=float

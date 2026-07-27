@@ -396,6 +396,55 @@ DDL: list[str] = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS liquidity_mode_runs (
+        mode_run_id TEXT PRIMARY KEY,
+        fit_cutoff REAL NOT NULL,
+        bin_seconds REAL NOT NULL,
+        lambda_penalty REAL NOT NULL,
+        lambda_selection TEXT NOT NULL,
+        centroids_json TEXT NOT NULL,
+        reference_stats_json TEXT NOT NULL,
+        calm_mode INTEGER NOT NULL,
+        train_bar_count INTEGER NOT NULL,
+        config_json TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        created_at REAL NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_mode_assignments (
+        mode_run_id TEXT NOT NULL,
+        condition_id TEXT NOT NULL,
+        bin_start REAL NOT NULL,
+        mode INTEGER NOT NULL,
+        mode_label TEXT NOT NULL CHECK (mode_label IN ('calm', 'event')),
+        in_training INTEGER NOT NULL,
+        assigned_at REAL NOT NULL,
+        PRIMARY KEY (mode_run_id, condition_id, bin_start)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS news_impact_screens (
+        mode_run_id TEXT NOT NULL,
+        event_family_id TEXT NOT NULL,
+        condition_id TEXT NOT NULL,
+        news_time REAL NOT NULL,
+        arrival_bin_start REAL NOT NULL,
+        pre_mode_label TEXT,
+        arrival_mode_label TEXT,
+        post_mode_label TEXT,
+        transition_detected INTEGER NOT NULL,
+        impact_score REAL NOT NULL,
+        screen_status TEXT NOT NULL CHECK (
+            screen_status IN ('screened', 'insufficient_coverage')
+        ),
+        screen_available_at REAL NOT NULL,
+        screen_model_version TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (mode_run_id, event_family_id, condition_id)
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS reasoning_judgments (
         reasoning_judgment_id TEXT PRIMARY KEY,
         decision_id TEXT NOT NULL,
@@ -469,6 +518,9 @@ REQUIRED_TABLES = [
     "relevance_judgments",
     "reasoning_judgments",
     "liquidity_bars",
+    "liquidity_mode_runs",
+    "liquidity_mode_assignments",
+    "news_impact_screens",
 ]
 
 LINEAGE_COLUMNS = ("raw_response_id", "parser_version", "schema_version", "normalized_at")
@@ -540,14 +592,18 @@ def ensure_paper_schema(conn: sqlite3.Connection) -> list[str]:
                     f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
                 )
                 applied.append(f"{table}.{name}")
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'liquidity_bars'"
-    ).fetchone()
-    if row is None:
+    existing_tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    for table in REQUIRED_TABLES:
+        if table in existing_tables:
+            continue
         for statement in DDL:
-            if "liquidity_bars" in statement:
+            if f"CREATE TABLE IF NOT EXISTS {table} " in statement:
                 conn.executescript(statement)
-                applied.append("liquidity_bars")
+                applied.append(table)
     rj_columns = {
         r[1] for r in conn.execute("PRAGMA table_info(relevance_judgments)")
     }

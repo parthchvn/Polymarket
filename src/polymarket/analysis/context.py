@@ -42,6 +42,7 @@ def build_context(
     episode: DecisionEpisode,
     *,
     market_state_lookback: float = 86400.0,
+    relevance_availability: str = "online_scored",
 ) -> DecisionContext:
     t = episode.anchor_time
     contract = None
@@ -94,10 +95,12 @@ def build_context(
     ]
     if episode.market_id and contract is not None:
         snapshot_rows, version_fallback = reader.relevance_snapshot_asof(
-            episode.market_id, contract["version_seq"], t
+            episode.market_id, contract["version_seq"], t,
+            availability_policy=relevance_availability,
         )
         context.relevance = _rows(snapshot_rows)
         context.coverage["relevance_version_fallback"] = version_fallback
+        context.coverage["relevance_availability"] = relevance_availability
     assert_no_future_information(
         {
             "contract": context.contract,

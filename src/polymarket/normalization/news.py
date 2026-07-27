@@ -108,6 +108,7 @@ class RuleBasedClaimExtractor:
 
 
 class RuleBasedRelevanceScorer:
+    method = "rule_keyword_overlap"
     """Keyword-overlap relevance with cue-word direction."""
 
     version = RELEVANCE_MODEL_VERSION
@@ -301,10 +302,13 @@ def normalize_news(
                 model_version = getattr(
                     scorer, "version", RELEVANCE_MODEL_VERSION
                 )
+                scorer_method = getattr(
+                    scorer, "method", "rule_keyword_overlap"
+                )
                 judgment_id = namespace_id(
                     "relevance", claim_id, family_id,
                     market["market_id"], market["version_seq"],
-                    "rule_keyword_overlap", model_version,
+                    scorer_method, model_version,
                 )
                 conn.execute(
                     """
@@ -322,7 +326,7 @@ def normalize_news(
                         first_observed_at, now, first_observed_at,
                         scored["rel_class"], scored["rel_score"],
                         scored["direction"], novelty,
-                        record.get("surprise"), "rule_keyword_overlap",
+                        record.get("surprise"), scorer_method,
                         model_version,
                         canonical_json(scored.get("evidence", {})),
                     ),
