@@ -63,14 +63,30 @@ def _family_times(
     ).fetchall()
 
 
-def _own_families(conn: sqlite3.Connection) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
+def _own_family_events(
+    conn: sqlite3.Connection, relevant_classes: tuple[str, ...]
+) -> dict[str, list[tuple[float, str]]]:
+    """condition -> [(available_at, family)] for RELEVANTLY judged
+    families, sorted by availability — so the historical "own" set at
+    time t contains only families whose relevant judgment's underlying
+    text was available by t (no future classifications leak into the
+    proxy)."""
+    placeholders = ",".join("?" for _ in relevant_classes)
+    out: dict[str, list[tuple[float, str]]] = {}
     for row in conn.execute(
-        "SELECT DISTINCT m.condition_id, r.event_family_id "
-        "FROM relevance_judgments r "
-        "JOIN markets m ON m.market_id = r.market_id"
+        f"SELECT m.condition_id, r.event_family_id, "
+        f"MIN(r.computed_at) AS available_at "
+        f"FROM relevance_judgments r "
+        f"JOIN markets m ON m.market_id = r.market_id "
+        f"WHERE r.rel_class IN ({placeholders}) "
+        f"GROUP BY m.condition_id, r.event_family_id",
+        relevant_classes,
     ):
-        out.setdefault(row[0], set()).add(row[1])
+        out.setdefault(row["condition_id"], []).append(
+            (float(row["available_at"]), row["event_family_id"])
+        )
+    for values in out.values():
+        values.sort()
     return out
 
 
@@ -88,10 +104,12 @@ def compute_distraction(
     """One proxy row per interval record, order-aligned."""
     from bisect import bisect_left, bisect_right
 
+    from polymarket.analysis.news_returns import RELEVANT_CLASSES
+
     claim_times = _claim_times(conn)
     family_rows = _family_times(conn)
     family_times = [row[0] for row in family_rows]
-    own = _own_families(conn)
+    own_events = _own_family_events(conn, RELEVANT_CLASSES)
     labels = {}
     if mode_run_id is not None:
         for row in conn.execute(
@@ -112,7 +130,12 @@ def compute_distraction(
                 bisect_right(family_times, t),
             )
         }
-        unrelated = window_families - own.get(record.condition_id, set())
+        own_list = own_events.get(record.condition_id, [])
+        own_asof = {
+            family for available_at, family in own_list
+            if available_at <= t
+        }
+        unrelated = window_families - own_asof
         prevalence = None
         if labels:
             bin_labels = [
@@ -133,70 +156,102 @@ def compute_distraction(
     return out
 
 
-def distraction_interaction_regression(
+PROXY_NAMES = ("cross_market_claim_count", "unrelated_family_count",
+               "weekend", "event_mode_prevalence")
+
+
+def distraction_interaction_regressions(
     conn: sqlite3.Connection,
     config: DecompositionConfig = DecompositionConfig(),
     spec: str = "all_relevant",
     horizon: float = 24 * 3600.0,
     mode_run_id: str | None = None,
 ) -> dict | None:
+    """ONE regression per standardized proxy (no composite index): the
+    interaction r_news x proxy_z is reported for each mechanism
+    separately, sharing the censored, fresh-endpoint sample with the
+    main drift regressions."""
+    from polymarket.analysis.underreaction import MarketCensor
+
     records = build_interval_records(conn, config, spec)
     proxies = compute_distraction(conn, records, mode_run_id)
     closes = CloseSeries(conn, config.bin_seconds)
-    rows, y = [], []
-    condition_labels, day_labels = [], []
-    raw_distraction = [
-        p["cross_market_claim_count"] + p["unrelated_family_count"]
-        + (5 if p["weekend"] else 0)
-        for p in proxies
-    ]
-    if not raw_distraction:
-        return None
-    mean = sum(raw_distraction) / len(raw_distraction)
-    var = sum((x - mean) ** 2 for x in raw_distraction) \
-        / max(len(raw_distraction) - 1, 1)
-    scale = math.sqrt(var) if var > 0 else 1.0
-    for record, raw in zip(records, raw_distraction):
-        t_end = record.bin_start + config.bin_seconds
-        base = closes.close_asof(record.condition_id, t_end)
-        future = closes.close_asof(
-            record.condition_id, t_end + horizon, max_staleness=horizon
-        )
-        if base is None or future is None:
+    censor = MarketCensor(conn)
+    results: dict[str, dict] = {}
+    for proxy_name in PROXY_NAMES:
+        raw = [
+            (1.0 if p[proxy_name] else 0.0)
+            if proxy_name == "weekend" else p[proxy_name]
+            for p in proxies
+        ]
+        if any(value is None for value in raw):
+            results[proxy_name] = {"skipped": "proxy unavailable"}
             continue
-        z = (raw - mean) / scale
-        rows.append([
-            record.r_news, record.r_news * z, z, record.r_nonnews,
-            record.close, math.log1p(record.turnover),
-        ])
-        y.append(future - base)
-        condition_labels.append(record.condition_id)
-        day_labels.append(int(record.bin_start // 86400))
-    if len(rows) < 20:
+        mean = sum(raw) / len(raw) if raw else 0.0
+        var = sum((x - mean) ** 2 for x in raw) / max(len(raw) - 1, 1)
+        scale = math.sqrt(var) if var > 0 else 1.0
+        rows, y = [], []
+        condition_labels, day_labels = [], []
+        for record, value in zip(records, raw):
+            t_end = record.bin_start + config.bin_seconds
+            base = closes.close_asof_with_time(
+                record.condition_id, t_end
+            )
+            if base is None:
+                continue
+            if not censor.open_through(
+                record.condition_id, t_end, t_end + horizon
+            ):
+                continue
+            future = closes.close_near_target(
+                record.condition_id, t_end + horizon, after=base[0]
+            )
+            if future is None:
+                continue
+            z = (value - mean) / scale
+            rows.append([
+                record.r_news, record.r_news * z, z,
+                record.r_nonnews, record.close,
+                math.log1p(record.turnover),
+            ])
+            y.append(future[1] - base[1])
+            condition_labels.append(record.condition_id)
+            day_labels.append(int(record.bin_start // 86400))
+        if len(rows) < 20:
+            results[proxy_name] = {"skipped": "insufficient sample"}
+            continue
+        X = np.asarray(rows)
+        y_arr = np.asarray(y)
+        entities = np.asarray(condition_labels)
+        X = _within_demean(X, entities)
+        y_arr = _within_demean(y_arr.reshape(-1, 1), entities).ravel()
+        X = np.column_stack([np.ones(len(X)), X])
+        fit = ols_clustered(
+            y_arr, X,
+            clusters={
+                "market": np.unique(entities, return_inverse=True)[1],
+                "utc_day": np.asarray(day_labels),
+            },
+        )
+        results[proxy_name] = {
+            "horizon_seconds": horizon,
+            "n": fit["n"],
+            "beta_news": float(fit["beta"][1]),
+            "beta_news_x_proxy": float(fit["beta"][2]),
+            "beta_proxy": float(fit["beta"][3]),
+            "se_interaction": {
+                name: float(se[2]) for name, se in fit["se"].items()
+            },
+            "cluster_counts": fit["cluster_counts"],
+        }
+    if not results:
         return None
-    X = np.asarray(rows)
-    y_arr = np.asarray(y)
-    entities = np.asarray(condition_labels)
-    X = _within_demean(X, entities)
-    y_arr = _within_demean(y_arr.reshape(-1, 1), entities).ravel()
-    X = np.column_stack([np.ones(len(X)), X])
-    fit = ols_clustered(
-        y_arr, X,
-        clusters={
-            "market": np.unique(entities, return_inverse=True)[1],
-            "utc_day": np.asarray(day_labels),
-        },
-    )
     return {
-        "horizon_seconds": horizon,
         "spec": spec,
-        "n": fit["n"],
-        "beta_news": float(fit["beta"][1]),
-        "beta_news_x_distraction": float(fit["beta"][2]),
-        "beta_distraction": float(fit["beta"][3]),
-        "se_interaction": {
-            name: float(se[2]) for name, se in fit["se"].items()
-        },
-        "prediction": "beta_news_x_distraction > 0 under the paper's "
-                      "distraction mechanism",
+        "prediction": "beta_news_x_proxy > 0 under the paper's "
+                      "distraction mechanism (proxies are ANALOGUES "
+                      "of the paper's attention measures, not direct "
+                      "reproductions)",
+        "proxies": results,
     }
+

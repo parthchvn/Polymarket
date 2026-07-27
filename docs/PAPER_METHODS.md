@@ -107,10 +107,45 @@ bars break DP chains instead of being interpolated.
   distraction.
 
 **Adaptations, marked as such:** interval-level local projections
-replace the paper's daily aggregation (the daily view is also
-reported); A_e is ours.  **Untested, not replicated:** the
-analyst-revision mechanism — it requires an external expectations
-series the pipeline does not have; the report says so explicitly.
+replace the paper's daily aggregation (the complete daily table is
+exported alongside); A_e is ours; the attention proxies are ANALOGUES
+of the paper's measures, each interacted separately (no composite
+index).  **Untested, not replicated:** the analyst-revision mechanism
+— it requires an external expectations series the pipeline does not
+have; the report says so explicitly.
+
+**Measurement discipline (review-driven):** future endpoints come
+from ``close_near_target`` — strictly after the base close and within
+one bar of the target, so stale series drop the observation instead of
+manufacturing zero returns (drop counts reported); horizon windows are
+CENSORED unless the same contract stayed open and tradeable through
+the endpoint (status timeline + contract-version equality + recorded
+resolution time), with time-to-resolution and probability-region
+controls in every regression; event drift endpoints must be genuinely
+post-news, and events flag intervening qualified news.
+
+**The news sample is a pinned contract** recorded with every run: the
+LATEST judgment per (claim, market) — pinnable to an approved
+method/model — must be in the relevant classes with a minimum score,
+judged against the contract version ACTIVE at arrival, and the claim
+must have entered its family as ``new`` (novelty; broaden
+``novel_edge_types`` explicitly to include confirmations).  The
+screened spec requires semantic relevance AND liquidity impact.
+
+**Inference:** CR1 by market, by UTC day, and CGM two-way; a moving
+DATE-block bootstrap (blocks at least the horizon length) for the news
+loading; below five market clusters t-statistics are REFUSED and a
+Rademacher wild-cluster bootstrap p is reported instead; placebo
+permutations run many seeds and report an empirical p-value.
+Distraction proxies use only classifications available as of each
+interval.
+
+**Availability wording:** mode runs record ``availability_mode``
+('reconstructed_prequential' by default — fit today with a historical
+training cutoff; 'live_deployed' only with a real
+``model_deployed_at``).  Online screens therefore prove the absence of
+post-news TRAINING data, not historical deployment, unless the run is
+live-deployed.
 
 **Model-availability discipline (screens):** an online-basis screen
 additionally requires the mode model to have EXISTED before the news

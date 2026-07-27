@@ -49,6 +49,87 @@ from polymarket.analysis.news_returns import (
 
 HORIZONS_SECONDS = (3600.0, 6 * 3600.0, 24 * 3600.0,
                     72 * 3600.0, 7 * 86400.0)
+MIN_MARKET_CLUSTERS = 5
+
+
+class MarketCensor:
+    """Prediction markets converge mechanically at resolution, so a
+    horizon window is admissible only if the SAME contract stayed open
+    and tradeable through the endpoint: no resolved/closed/disabled
+    status effective inside the window, no contract-version change,
+    and the window ends before any recorded resolution time."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._timeline: dict[str, list[tuple[float, bool]]] = {}
+        self._versions: dict[str, list[float]] = {}
+        self._resolution: dict[str, float] = {}
+        for row in conn.execute(
+            "SELECT m.condition_id, s.effective_from, s.trading_enabled,"
+            " s.closed, s.resolved FROM market_status_versions s "
+            "JOIN markets m ON m.market_id = s.market_id"
+        ):
+            blocking = bool(
+                (not row["trading_enabled"]) or row["closed"]
+                or row["resolved"]
+            )
+            self._timeline.setdefault(
+                row["condition_id"], []
+            ).append((float(row["effective_from"]), blocking))
+        for row in conn.execute(
+            "SELECT m.condition_id, v.effective_from, v.resolution_time "
+            "FROM contract_versions v "
+            "JOIN markets m ON m.market_id = v.market_id"
+        ):
+            self._versions.setdefault(
+                row["condition_id"], []
+            ).append(float(row["effective_from"]))
+            if row["resolution_time"] is not None:
+                current = self._resolution.get(
+                    row["condition_id"], float("inf")
+                )
+                self._resolution[row["condition_id"]] = min(
+                    current, float(row["resolution_time"])
+                )
+        for values in self._timeline.values():
+            values.sort()
+        for values in self._versions.values():
+            values.sort()
+
+    def open_through(
+        self, condition_id: str, start: float, end: float
+    ) -> bool:
+        from bisect import bisect_left
+        from bisect import bisect_right as _br
+
+        timeline = self._timeline.get(condition_id, [])
+        # the status in force at the window START must be tradeable ...
+        index = _br([t for t, _ in timeline], start) - 1
+        if index >= 0 and timeline[index][1]:
+            return False           # already blocked when the window opens
+        # ... and no blocking status may take effect inside the window
+        for effective_from, blocking in timeline[index + 1:]:
+            if effective_from > end:
+                break
+            if blocking:
+                return False
+        versions = self._versions.get(condition_id, [])
+        if versions and (
+            bisect_left(versions, start + 1e-9)
+            != _br(versions, end)
+        ):
+            return False           # the contract changed mid-window
+        resolution = self._resolution.get(condition_id)
+        if resolution is not None and end >= resolution:
+            return False
+        return True
+
+    def time_to_resolution(
+        self, condition_id: str, ts: float
+    ) -> float | None:
+        resolution = self._resolution.get(condition_id)
+        if resolution is None:
+            return None
+        return max(0.0, resolution - ts)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +159,13 @@ class CloseSeries:
 
     def close_asof(self, condition_id: str, ts: float,
                    max_staleness: float | None = None) -> float | None:
+        found = self.close_asof_with_time(condition_id, ts, max_staleness)
+        return found[1] if found else None
+
+    def close_asof_with_time(
+        self, condition_id: str, ts: float,
+        max_staleness: float | None = None,
+    ) -> tuple[float, float] | None:
         times = self._times.get(condition_id)
         if not times:
             return None
@@ -87,38 +175,169 @@ class CloseSeries:
         if (max_staleness is not None
                 and ts - times[index] > max_staleness):
             return None
-        return self._values[condition_id][index]
+        return times[index], self._values[condition_id][index]
+
+    def close_near_target(
+        self, condition_id: str, target: float,
+        *, after: float, tolerance: float | None = None,
+    ) -> tuple[float, float] | None:
+        """The close nearest ``target`` that is (a) strictly after
+        ``after`` (the base timestamp — so a stale series can never
+        reuse the base close and manufacture a zero future return) and
+        (b) within ``tolerance`` of the target (default: one bar).
+        Returns (timestamp, value) or None — missing is missing."""
+        tolerance = (
+            tolerance if tolerance is not None else self.bin_seconds
+        )
+        times = self._times.get(condition_id)
+        if not times:
+            return None
+        best: tuple[float, float] | None = None
+        index = bisect_right(times, target + tolerance) - 1
+        while index >= 0 and times[index] >= target - tolerance:
+            if times[index] > after:
+                candidate = (times[index],
+                             self._values[condition_id][index])
+                if (best is None or abs(candidate[0] - target)
+                        < abs(best[0] - target)):
+                    best = candidate
+            index -= 1
+        return best
 
 
 # ---------------------------------------------------------------------------
 # OLS with fixed effects and clustered standard errors
 # ---------------------------------------------------------------------------
+def _cluster_cov(
+    X: np.ndarray, residuals: np.ndarray, labels: np.ndarray,
+    XtX_inv: np.ndarray,
+) -> np.ndarray:
+    n, k = X.shape
+    groups = np.unique(labels)
+    meat = np.zeros((k, k))
+    for group in groups:
+        mask = labels == group
+        score = X[mask].T @ residuals[mask]
+        meat += np.outer(score, score)
+    g = len(groups)
+    correction = (g / max(g - 1, 1)) * ((n - 1) / max(n - k, 1))
+    return correction * XtX_inv @ meat @ XtX_inv
+
+
 def ols_clustered(
     y: np.ndarray,
     X: np.ndarray,
     clusters: dict[str, np.ndarray],
 ) -> dict:
-    """OLS with CR1 cluster-robust standard errors, one clustering per
-    entry in ``clusters`` (each an integer label array)."""
+    """OLS with CR1 cluster-robust SEs per clustering, plus CGM
+    two-way clustering (V_a + V_b - V_intersection) when exactly the
+    'market' and 'utc_day' clusterings are both supplied, and
+    cluster-count diagnostics."""
     n, k = X.shape
     XtX_inv = np.linalg.pinv(X.T @ X)
     beta = XtX_inv @ (X.T @ y)
     residuals = y - X @ beta
-    out = {"beta": beta, "n": int(n), "se": {}}
+    out = {"beta": beta, "n": int(n), "se": {}, "cluster_counts": {}}
+    covs = {}
     for name, labels in clusters.items():
-        groups = np.unique(labels)
-        meat = np.zeros((k, k))
-        for group in groups:
-            mask = labels == group
-            Xg = X[mask]
-            ug = residuals[mask]
-            score = Xg.T @ ug
-            meat += np.outer(score, score)
-        g = len(groups)
-        correction = (g / max(g - 1, 1)) * ((n - 1) / max(n - k, 1))
-        cov = correction * XtX_inv @ meat @ XtX_inv
+        cov = _cluster_cov(X, residuals, labels, XtX_inv)
+        covs[name] = cov
         out["se"][name] = np.sqrt(np.clip(np.diag(cov), 0, None))
+        out["cluster_counts"][name] = int(len(np.unique(labels)))
+    if "market" in clusters and "utc_day" in clusters:
+        intersection = (
+            clusters["market"].astype(np.int64) * 1_000_003
+            + clusters["utc_day"].astype(np.int64)
+        )
+        cov_two_way = (
+            covs["market"] + covs["utc_day"]
+            - _cluster_cov(X, residuals, intersection, XtX_inv)
+        )
+        out["se"]["two_way"] = np.sqrt(
+            np.clip(np.diag(cov_two_way), 0, None)
+        )
+        out["cluster_counts"]["two_way_min"] = min(
+            out["cluster_counts"]["market"],
+            out["cluster_counts"]["utc_day"],
+        )
     return out
+
+
+def moving_block_bootstrap(
+    y: np.ndarray, X: np.ndarray, day_labels: np.ndarray,
+    *, coef_index: int, block_days: int, n_boot: int = 200,
+    seed: int = 7,
+) -> dict:
+    """Moving-DATE-block bootstrap for one coefficient: contiguous
+    day blocks at least as long as the horizon are resampled with
+    replacement, so overlapping-outcome dependence within a block is
+    preserved."""
+    rng = np.random.default_rng(seed)
+    days = np.unique(day_labels)
+    if len(days) < 2 * block_days:
+        return {"skipped": f"only {len(days)} days for "
+                           f"{block_days}-day blocks"}
+    day_index = {day: np.flatnonzero(day_labels == day)
+                 for day in days}
+    starts = days[: max(1, len(days) - block_days + 1)]
+    n_blocks = max(1, int(math.ceil(len(days) / block_days)))
+    draws = []
+    for _ in range(n_boot):
+        rows: list[np.ndarray] = []
+        for start in rng.choice(starts, size=n_blocks, replace=True):
+            for day in range(int(start), int(start) + block_days):
+                if day in day_index:
+                    rows.append(day_index[day])
+        take = np.concatenate(rows)
+        Xb, yb = X[take], y[take]
+        beta = np.linalg.pinv(Xb.T @ Xb) @ (Xb.T @ yb)
+        draws.append(float(beta[coef_index]))
+    draws_arr = np.asarray(draws)
+    return {
+        "se": float(draws_arr.std(ddof=1)),
+        "ci_2_5": float(np.percentile(draws_arr, 2.5)),
+        "ci_97_5": float(np.percentile(draws_arr, 97.5)),
+        "n_boot": int(n_boot),
+        "block_days": int(block_days),
+    }
+
+
+def wild_cluster_bootstrap_p(
+    y: np.ndarray, X: np.ndarray, labels: np.ndarray,
+    *, coef_index: int, n_boot: int = 499, seed: int = 11,
+) -> float:
+    """Rademacher wild-cluster bootstrap p-value for H0: beta_j = 0
+    (null-imposed residuals, per-cluster sign flips) — the small-
+    cluster-count inference of Cameron-Gelbach-Miller."""
+    rng = np.random.default_rng(seed)
+    restricted = np.delete(X, coef_index, axis=1)
+    beta_r = np.linalg.pinv(restricted.T @ restricted) @ (
+        restricted.T @ y
+    )
+    u0 = y - restricted @ beta_r
+    XtX_inv = np.linalg.pinv(X.T @ X)
+    beta_hat = XtX_inv @ (X.T @ y)
+    se = np.sqrt(_cluster_cov(
+        X, y - X @ beta_hat, labels, XtX_inv
+    )[coef_index, coef_index])
+    if se <= 0:
+        return float("nan")
+    t_obs = abs(beta_hat[coef_index] / se)
+    groups = np.unique(labels)
+    exceed = 0
+    for _ in range(n_boot):
+        flips = rng.choice([-1.0, 1.0], size=len(groups))
+        u_star = u0 * flips[np.searchsorted(groups, labels)]
+        y_star = restricted @ beta_r + u_star
+        beta_star = XtX_inv @ (X.T @ y_star)
+        se_star = np.sqrt(_cluster_cov(
+            X, y_star - X @ beta_star, labels, XtX_inv
+        )[coef_index, coef_index])
+        if se_star > 0 and abs(
+            beta_star[coef_index] / se_star
+        ) >= t_obs:
+            exceed += 1
+    return (exceed + 1) / (n_boot + 1)
 
 
 def _within_demean(
@@ -141,8 +360,24 @@ class DriftRegressionResult:
     beta_nonnews: float
     se_news_by_cluster: dict[str, float]
     se_nonnews_by_cluster: dict[str, float]
+    cluster_counts: dict[str, int]
+    censored: int = 0
+    stale_endpoint_dropped: int = 0
+    inference_note: str | None = None
+    block_bootstrap: dict | None = None
+    wild_cluster_p_news: float | None = None
+
+    @property
+    def inference_admissible(self) -> bool:
+        return self.cluster_counts.get("market", 0)             >= MIN_MARKET_CLUSTERS
 
     def as_dict(self) -> dict:
+        t_news = None
+        if self.inference_admissible:
+            t_news = {
+                name: (self.beta_news / se if se > 0 else None)
+                for name, se in self.se_news_by_cluster.items()
+            }
         return {
             "horizon_seconds": self.horizon_seconds,
             "spec": self.spec,
@@ -151,10 +386,13 @@ class DriftRegressionResult:
             "beta_nonnews": self.beta_nonnews,
             "se_news": self.se_news_by_cluster,
             "se_nonnews": self.se_nonnews_by_cluster,
-            "t_news": {
-                name: (self.beta_news / se if se > 0 else None)
-                for name, se in self.se_news_by_cluster.items()
-            },
+            "cluster_counts": self.cluster_counts,
+            "censored_observations": self.censored,
+            "stale_endpoint_dropped": self.stale_endpoint_dropped,
+            "t_news": t_news,
+            "inference_note": self.inference_note,
+            "block_bootstrap_news": self.block_bootstrap,
+            "wild_cluster_p_news": self.wild_cluster_p_news,
         }
 
 
@@ -187,26 +425,42 @@ def run_drift_regressions(
     if placebo_seed is not None:
         records = _placebo_shift(records, placebo_seed)
     closes = CloseSeries(conn, config.bin_seconds)
+    censor = MarketCensor(conn)
     results = []
     for horizon in horizons:
         rows, y = [], []
         condition_labels, day_labels = [], []
+        censored = stale_dropped = 0
         for index, record in enumerate(records):
             t_end = record.bin_start + config.bin_seconds
-            base = closes.close_asof(record.condition_id, t_end)
-            future = closes.close_asof(
-                record.condition_id, t_end + horizon,
-                max_staleness=horizon,
+            base = closes.close_asof_with_time(
+                record.condition_id, t_end
             )
-            if base is None or future is None:
-                continue  # missing coverage is missing, never zero
+            if base is None:
+                continue
+            base_ts, base_value = base
+            if not censor.open_through(
+                record.condition_id, t_end, t_end + horizon
+            ):
+                censored += 1     # resolution is not continuation
+                continue
+            future = closes.close_near_target(
+                record.condition_id, t_end + horizon, after=base_ts
+            )
+            if future is None:
+                stale_dropped += 1  # missing is missing, never zero
+                continue
+            ttr = censor.time_to_resolution(record.condition_id, t_end)
             rows.append([
                 record.r_news, record.r_nonnews, record.close,
+                abs(record.close),                # probability region
                 record.spread_mean or 0.0,
                 math.log1p(record.turnover),
                 _trailing_vol(records, index),
+                math.log1p(ttr) if ttr is not None else 0.0,
+                0.0 if ttr is not None else 1.0,  # ttr missing flag
             ])
-            y.append(future - base)
+            y.append(future[1] - base_value)
             condition_labels.append(record.condition_id)
             day_labels.append(int(record.bin_start // 86400))
         if len(rows) < 20:
@@ -217,12 +471,27 @@ def run_drift_regressions(
         X = _within_demean(X, entities)
         y_arr = _within_demean(y_arr.reshape(-1, 1), entities).ravel()
         X = np.column_stack([np.ones(len(X)), X])
+        market_labels = np.unique(entities, return_inverse=True)[1]
+        days_arr = np.asarray(day_labels)
         fit = ols_clustered(
             y_arr, X,
-            clusters={
-                "market": np.unique(entities, return_inverse=True)[1],
-                "utc_day": np.asarray(day_labels),
-            },
+            clusters={"market": market_labels, "utc_day": days_arr},
+        )
+        n_markets = fit["cluster_counts"]["market"]
+        note = None
+        wild_p = None
+        if n_markets < MIN_MARKET_CLUSTERS:
+            note = (
+                f"only {n_markets} market clusters (<"
+                f"{MIN_MARKET_CLUSTERS}): t-statistics refused; wild-"
+                "cluster bootstrap p reported instead"
+            )
+            wild_p = wild_cluster_bootstrap_p(
+                y_arr, X, market_labels, coef_index=1
+            )
+        block = moving_block_bootstrap(
+            y_arr, X, days_arr, coef_index=1,
+            block_days=max(1, int(math.ceil(horizon / 86400.0))),
         )
         results.append(DriftRegressionResult(
             horizon_seconds=horizon, spec=spec, n=fit["n"],
@@ -234,6 +503,12 @@ def run_drift_regressions(
             se_nonnews_by_cluster={
                 name: float(se[2]) for name, se in fit["se"].items()
             },
+            cluster_counts=fit["cluster_counts"],
+            censored=censored,
+            stale_endpoint_dropped=stale_dropped,
+            inference_note=note,
+            block_bootstrap=block,
+            wild_cluster_p_news=wild_p,
         ))
     return results
 
@@ -276,26 +551,42 @@ def event_absorption(
 
     h0 = initial_horizon or config.bin_seconds
     closes = CloseSeries(conn, config.bin_seconds)
+    censor = MarketCensor(conn)
     events = []
-    for condition_id, arrivals in _news_arrivals(
-        conn, config, spec
-    ).items():
-        for tau, claim_id in sorted(arrivals):
-            pre = closes.close_asof(
+    all_arrivals = _news_arrivals(conn, config, spec)
+    for condition_id, arrivals in all_arrivals.items():
+        ordered = sorted(arrivals)
+        for position, (tau, claim_id) in enumerate(ordered):
+            pre_found = closes.close_asof_with_time(
                 condition_id, tau, max_staleness=2 * config.bin_seconds
             )
-            at_h0 = closes.close_asof(
-                condition_id, tau + h0,
-                max_staleness=2 * config.bin_seconds,
-            )
-            at_h = closes.close_asof(
+            pre = pre_found[1] if pre_found else None
+            # endpoints must be genuinely POST-news, fresh, and the
+            # market must stay open/unchanged through the window
+            h0_found = closes.close_near_target(
+                condition_id, tau + h0, after=tau,
+            ) if pre_found else None
+            h_found = closes.close_near_target(
                 condition_id, tau + drift_horizon,
-                max_staleness=2 * config.bin_seconds,
+                after=(h0_found[0] if h0_found else tau),
+            ) if h0_found else None
+            open_through = censor.open_through(
+                condition_id, tau, tau + drift_horizon
             )
-            coverage_complete = None not in (pre, at_h0, at_h)
+            at_h0 = h0_found[1] if h0_found else None
+            at_h = h_found[1] if h_found else None
+            coverage_complete = (
+                None not in (pre, at_h0, at_h) and open_through
+            )
+            intervening = any(
+                tau < other_tau <= tau + drift_horizon
+                for other_tau, _ in ordered[position + 1:]
+            )
             record = {
                 "condition_id": condition_id, "claim_id": claim_id,
                 "news_time": tau, "coverage_complete": coverage_complete,
+                "market_open_through_window": open_through,
+                "intervening_news": intervening,
                 "initial_response": None, "later_drift": None,
                 "same_direction_continuation": None,
                 "absorption_fraction": None,

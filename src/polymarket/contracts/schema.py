@@ -402,6 +402,9 @@ DDL: list[str] = [
         bin_seconds REAL NOT NULL,
         lambda_penalty REAL NOT NULL,
         lambda_selection TEXT NOT NULL,
+        model_deployed_at REAL,
+        availability_mode TEXT NOT NULL
+            DEFAULT 'reconstructed_prequential',
         centroids_json TEXT NOT NULL,
         reference_stats_json TEXT NOT NULL,
         calm_mode INTEGER NOT NULL,
@@ -586,6 +589,11 @@ _PAPER_COLUMNS = {
     "liquidity_mode_assignments": (
         ("mode_online", "INTEGER NOT NULL DEFAULT 0"),
         ("mode_label_online", "TEXT NOT NULL DEFAULT 'calm'"),
+    ),
+    "liquidity_mode_runs": (
+        ("model_deployed_at", "REAL"),
+        ("availability_mode",
+         "TEXT NOT NULL DEFAULT 'reconstructed_prequential'"),
     ),
 }
 
