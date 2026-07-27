@@ -23,22 +23,22 @@ import argparse
 import json
 import os
 import sys
-import time
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
 
 from polymarket.collection.activity import collect_activity
 from polymarket.collection.books import collect_book
 from polymarket.collection.client import ObservingClient
 from polymarket.collection.markets import collect_markets
+from polymarket.collection.news import collect_google_news_rss
 from polymarket.collection.raw_store import (
     finish_collector_run,
-    insert_raw_response,
     start_collector_run,
 )
 from polymarket.collection.trades import collect_trades
 from polymarket.contracts.schema import connect, init_db
-from polymarket.normalization.markets import derive_market_state_from_executions
+from polymarket.normalization.markets import (
+    derive_market_state_from_books,
+    derive_market_state_from_executions,
+)
 from polymarket.normalization.normalizer import Normalizer
 from polymarket.normalization.reconciliation import reconcile_roles
 
@@ -63,56 +63,6 @@ def collect_surface(conn, collector, params, fn, **kwargs):
     if count is not None:
         print(f"  {collector}: {count} records")
     return outcome
-
-
-def collect_google_news(conn, query: str) -> int:
-    """Fetch a Google News RSS feed and store it as the shared news-feed
-    JSON contract (headline/body/publishedAt), like every news source.
-    The stored payload is exactly what this pilot's news source emits."""
-    import urllib.parse
-    import urllib.request
-
-    url = (
-        "https://news.google.com/rss/search?q="
-        + urllib.parse.quote(query) + "&hl=en-US&gl=US&ceid=US:en"
-    )
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0"}
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        xml_bytes = response.read()
-    root = ET.fromstring(xml_bytes)
-    records = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub = item.findtext("pubDate")
-        try:
-            published = parsedate_to_datetime(pub).timestamp() if pub else None
-        except (TypeError, ValueError):
-            published = None
-        if not title or published is None:
-            continue
-        records.append({
-            "id": link or title,
-            "url": link,
-            "publishedAt": published,
-            "timestampSource": "feed",
-            "timestampConfidence": 0.8,
-            "headline": title,
-            "body": title,
-        })
-    run_id = _collector_run(conn, "news:google-rss", {"query": query})
-    insert_raw_response(
-        conn, collector_run_id=run_id, collector="news:google-rss",
-        base_url="https://news.google.com", endpoint="news_feed",
-        params={"query": query}, requested_at=time.time() - 1,
-        received_at=time.time(), http_status=200, headers={},
-        payload=json.dumps(records, sort_keys=True).encode(),
-    )
-    finish_collector_run(conn, run_id, "succeeded")
-    print(f"  news:google-rss [{query!r}]: {len(records)} articles")
-    return len(records)
 
 
 def top_taker_wallets(conn, condition_ids, limit):
@@ -198,7 +148,8 @@ def main(argv=None) -> int:
                 collect_activity, wallet=wallet, max_pages=10,
             )
         for query in args.news_query:
-            collect_google_news(conn, query)
+            count = collect_google_news_rss(conn, query)
+            print(f"  news:google-rss [{query!r}]: {count} articles")
 
     print("normalizing (final pass) ...")
     results = Normalizer(conn).normalize_all()
@@ -212,6 +163,9 @@ def main(argv=None) -> int:
         derive_market_state_from_executions(
             conn, condition_id, bucket_seconds=3600.0
         )
+        book_states = derive_market_state_from_books(conn, condition_id)
+        if book_states:
+            print(f"  book-mid states for {condition_id[:14]}…: {book_states}")
     conn.commit()
 
     from polymarket.analysis.reporting import audit_database

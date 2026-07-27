@@ -40,8 +40,14 @@ def paginate_offset(
     limit: int = 100,
     max_pages: int = 1000,
     start_offset: int = 0,
+    stop_predicate: Callable[[list[Any]], bool] | None = None,
 ) -> PaginationOutcome:
-    """Offset-based pagination with repeated-page detection."""
+    """Offset-based pagination with repeated-page detection.
+
+    ``stop_predicate(records)`` is evaluated AFTER a page is stored:
+    returning True ends pagination with the page included, so
+    newest-first feeds can stop once a page reaches already-collected
+    territory without losing the overlap records."""
     outcome = PaginationOutcome()
     seen_hashes: set[str] = set()
     offset = start_offset
@@ -66,6 +72,9 @@ def paginate_offset(
         outcome.pages.append(PageResult(raw_id, records, params))
         outcome.record_count += len(records)
         if len(records) < limit:
+            return outcome
+        if stop_predicate is not None and stop_predicate(records):
+            outcome.note = "stopped by predicate (cursor reached)"
             return outcome
         offset += limit
     outcome.status = "incomplete"

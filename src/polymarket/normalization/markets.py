@@ -301,3 +301,55 @@ def derive_market_state_from_executions(
         inserted += cur.rowcount
     conn.commit()
     return inserted
+
+
+def derive_market_state_from_books(
+    conn: sqlite3.Connection,
+    condition_id: str,
+) -> int:
+    """Derive mid-price market_state rows from order-book snapshots
+    (state_source='book_mid').
+
+    Execution-derived state oscillates with taker flow (buys print near
+    the ask, sells near the bid), which can make flow look mechanically
+    contrarian.  Book-mid state is flow-independent: the positive
+    outcome token's (best_bid + best_ask) / 2 at each snapshot, with the
+    snapshot's spread, depth and imbalance carried through.  Rows
+    coexist with execution-derived state under the
+    (condition_id, ts, state_source) primary key; readers take the
+    latest state before a cutoff regardless of source.
+    """
+    rows = conn.execute(
+        """
+        SELECT b.observed_at, b.best_bid, b.best_ask, b.spread,
+               b.bid_depth, b.ask_depth, b.imbalance
+        FROM order_book_snapshots b
+        JOIN outcome_tokens o ON o.asset = b.asset
+        WHERE o.condition_id = ? AND o.outcome_sign = 1
+          AND b.best_bid IS NOT NULL AND b.best_ask IS NOT NULL
+        ORDER BY b.observed_at
+        """,
+        (condition_id,),
+    ).fetchall()
+    written = 0
+    now = time.time()
+    for observed_at, bid, ask, spread, bid_depth, ask_depth, imbalance in rows:
+        mid = (bid + ask) / 2.0
+        depth = (bid_depth or 0.0) + (ask_depth or 0.0)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO market_state
+                (condition_id, ts, positive_price, volume, spread, depth,
+                 imbalance, state_source, coverage_complete,
+                 raw_response_id, parser_version, schema_version,
+                 normalized_at)
+            VALUES (?, ?, ?, NULL, ?, ?, ?, 'book_mid', 1, NULL, ?, ?, ?)
+            """,
+            (
+                condition_id, observed_at, mid, spread, depth, imbalance,
+                PARSER_VERSION, SCHEMA_VERSION, now,
+            ),
+        )
+        written += 1
+    conn.commit()
+    return written

@@ -51,15 +51,27 @@ def collect_trades(
         "market": condition_id,
         "takerOnly": "true" if taker_only else "false",
     }
-    # Historical time-window parameter semantics are unvalidated against
-    # the live API; pass through only when explicitly requested.
+    # VALIDATED against production (2026-07): the data-api /trades
+    # endpoint IGNORES every server-side time-filter param (after,
+    # startTs, from, fromTimestamp).  Results are newest-first, so
+    # incremental collection uses a client-side early stop: paginate
+    # until a page reaches already-collected territory (start_ts), and
+    # keep that page for overlap — dedup happens at normalization via
+    # record fingerprints.
+    stop_predicate = None
     if start_ts is not None:
-        params["after"] = int(start_ts)
+        def stop_predicate(records: list[Any]) -> bool:
+            timestamps = [
+                float(r.get("timestamp", 0)) for r in records
+                if isinstance(r, dict)
+            ]
+            return bool(timestamps) and min(timestamps) <= start_ts
     if end_ts is not None:
-        params["before"] = int(end_ts)
+        params["before"] = int(end_ts)  # still unvalidated; explicit only
     return paginate_offset(
         _fetch_factory(client, TRADES_ENDPOINT),
         base_params=params,
         limit=limit,
         max_pages=max_pages,
+        stop_predicate=stop_predicate,
     )
