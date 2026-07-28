@@ -241,23 +241,29 @@ def cluster_stability(
     Z_a: np.ndarray, Z_b: np.ndarray, k: int,
 ) -> float:
     """Fraction of points whose cluster assignment is preserved under
-    the best greedy centroid matching between two runs — the 'attach
-    names only after clusters prove stable' measurement."""
-    labels_a, centroids_a = kmeans(Z_a, k, seed=3)
-    labels_b, centroids_b = kmeans(Z_b, k, seed=17)
+    the best cluster matching between two runs — the 'attach names
+    only after clusters prove stable' measurement.
+
+    Matching is by PARTITION OVERLAP (contingency counts), never by
+    centroid geometry: the rank-K latent space is identified only up
+    to sign/rotation, so centroids from different seeds live in
+    different coordinate frames and geometric matching produces
+    spurious zero stability on perfectly reproducible partitions."""
+    labels_a, _ = kmeans(Z_a, k, seed=3)
+    labels_b, _ = kmeans(Z_b, k, seed=17)
+    contingency = np.zeros((k, k), dtype=int)
+    for a, b in zip(labels_a, labels_b):
+        contingency[a, b] += 1
     remaining = list(range(k))
-    mapping: dict[int, int] = {}
-    for i in range(k):
-        best = min(
-            remaining,
-            key=lambda j: float(
-                ((centroids_a[i] - centroids_b[j]) ** 2).sum()
-            ),
+    matched = 0
+    # greedy maximum-overlap assignment (k is small)
+    for i in np.argsort(-contingency.max(axis=1)):
+        best = max(
+            remaining, key=lambda j: contingency[i, j]
         )
-        mapping[i] = best
+        matched += contingency[i, best]
         remaining.remove(best)
-    mapped = np.array([mapping[label] for label in labels_a])
-    return float((mapped == labels_b).mean())
+    return float(matched / len(labels_a))
 
 
 # ---------------------------------------------------------------------------
@@ -314,27 +320,41 @@ def evaluate_latent_reasoning(
             .fit(Xs[train_mask], y[train_mask]).encode(Xs),
             n_clusters,
         )
+        loss_null = _log_loss(y[test_mask], p_null)
+        loss_base = _log_loss(y[test_mask], p_base)
+        loss_latent = _log_loss(y[test_mask], p_latent)
         report["splits"][split_name] = {
             "status": "evaluated",
             "n_train": int(train_mask.sum()),
             "n_test": int(test_mask.sum()),
-            "log_loss_null": _log_loss(y[test_mask], p_null),
-            "log_loss_c_only": _log_loss(y[test_mask], p_base),
-            "log_loss_latent": _log_loss(y[test_mask], p_latent),
-            "latent_beats_c_only": bool(
-                _log_loss(y[test_mask], p_latent)
-                < _log_loss(y[test_mask], p_base)
-            ),
+            "log_loss_null": loss_null,
+            "log_loss_c_only": loss_base,
+            "log_loss_latent": loss_latent,
+            "latent_beats_c_only": bool(loss_latent < loss_base),
+            "latent_beats_null": bool(loss_latent < loss_null),
             "cluster_stability": stability,
         }
-    report["gate_1_predictive_value"] = all(
-        block.get("latent_beats_c_only", False)
-        for block in report["splits"].values()
+    evaluated = [
+        block for block in report["splits"].values()
         if block.get("status") == "evaluated"
-    ) and any(
-        block.get("status") == "evaluated"
-        for block in report["splits"].values()
+    ]
+    # the gate requires BOTH: beating the C-only baseline AND the
+    # base-rate null on every evaluated split — beating a baseline
+    # that itself loses to the null is regularization, not extracted
+    # decision structure
+    report["gate_1_predictive_value"] = bool(evaluated) and all(
+        block["latent_beats_c_only"] and block["latent_beats_null"]
+        for block in evaluated
     )
+    if evaluated and not report["gate_1_predictive_value"] and all(
+        block["latent_beats_c_only"] for block in evaluated
+    ):
+        report["gate_1_note"] = (
+            "latent beats the C-only baseline on every split but "
+            "loses to the base-rate null on at least one: a "
+            "regularization advantage on thin data, NOT evidence of "
+            "extracted decision structure on that split"
+        )
     report["naming_policy"] = (
         "latent dimensions are UNNAMED (latent_0..latent_"
         f"{latent_dim - 1}); candidate primitives "
