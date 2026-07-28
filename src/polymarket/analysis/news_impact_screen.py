@@ -23,11 +23,22 @@ Assignment basis and availability honesty:
   offline analysis only, never for online availability claims.
 
 Model availability: an ``online_filtered`` screen additionally
-requires that the fitted model EXISTED before the news — the run's
-``fit_cutoff`` is its ``model_effective_from``, and claims arriving
-before it get ``screen_status = 'model_unavailable'`` under the online
-basis (a model trained partly on bars after an event must not claim to
-have screened that event online).  Retrospective screens are exempt by
+requires that the fitted model EXISTED before the news, under the
+run's declared ``availability_mode``:
+
+* ``reconstructed_prequential`` (default): the honest claim is only
+  "no post-news TRAINING data", so the gate is
+  ``news_time >= fit_cutoff``;
+* ``live_deployed``: the model actually ran from
+  ``model_deployed_at``, so the gate is
+  ``news_time >= model_deployed_at`` — news between the training
+  cutoff and deployment was NOT screened by a running model and gets
+  ``model_unavailable``.  A live_deployed run without a deployment
+  time is refused outright.
+
+Claims failing the gate get ``screen_status = 'model_unavailable'``
+under the online basis; the per-row ``model_effective_from`` records
+the threshold actually applied.  Retrospective screens are exempt by
 definition.
 
 Boundary coverage is three-valued: IMPACTFUL when any observed
@@ -99,7 +110,18 @@ def screen_news_impact(
         "mode_run_id": mode_run_id,
         "assignment_basis": assignment_basis,
     }
-    model_effective_from = float(run["fit_cutoff"])
+    availability_mode = run.get(
+        "availability_mode", "reconstructed_prequential"
+    ) or "reconstructed_prequential"
+    if availability_mode == "live_deployed":
+        if run.get("model_deployed_at") is None:
+            raise ValueError(
+                "mode run is marked live_deployed but has no "
+                "model_deployed_at; refusing to screen"
+            )
+        model_effective_from = float(run["model_deployed_at"])
+    else:
+        model_effective_from = float(run["fit_cutoff"])
     now = time.time()
     for target in _news_targets(conn):
         news_time = float(target["news_time"])
@@ -180,6 +202,7 @@ def impactful_news_asof(
         WHERE mode_run_id = ? AND condition_id = ?
           AND assignment_basis = ?
           AND screen_status = 'screened'
+          AND transition_detected = 1
           AND screen_available_at < ?
         ORDER BY news_time
         """,

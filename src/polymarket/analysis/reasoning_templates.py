@@ -56,7 +56,12 @@ TEMPLATES: dict[str, ReasoningTemplate] = {
             expected_channels=("persistent_news",),
             required_evidence=("aged_relevant_news",),
             required_counterfactuals=("remove_persistent_news",),
-            incompatible_conditions=("news_decay_missing",),
+            # tightened (PR C): when impact screens ran for this market
+            # and found NO impactful news, the market's own liquidity
+            # reaction contradicts a persistent-adjustment story
+            incompatible_conditions=(
+                "news_decay_missing", "impact_screen_contradiction",
+            ),
         ),
         ReasoningTemplate(
             name="MARKET_MOMENTUM",

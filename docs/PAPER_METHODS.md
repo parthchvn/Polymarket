@@ -140,12 +140,46 @@ permutations run many seeds and report an empirical p-value.
 Distraction proxies use only classifications available as of each
 interval.
 
-**Availability wording:** mode runs record ``availability_mode``
-('reconstructed_prequential' by default — fit today with a historical
-training cutoff; 'live_deployed' only with a real
-``model_deployed_at``).  Online screens therefore prove the absence of
-post-news TRAINING data, not historical deployment, unless the run is
-live-deployed.
+**Availability wording — now ENFORCED:** mode runs record
+``availability_mode`` ('reconstructed_prequential' by default — fit
+today with a historical training cutoff; 'live_deployed' only with a
+real ``model_deployed_at``, settable via
+``fit-liquidity-modes --availability-mode --model-deployed-at``).  The
+screen applies the mode: prequential runs gate online screens at the
+training cutoff (proving only the absence of post-news training data),
+while live-deployed runs gate at the DEPLOYMENT time — news between
+cutoff and deployment is ``model_unavailable`` — and a live-deployed
+run without a deployment timestamp is refused outright.  The per-row
+``model_effective_from`` records the threshold actually applied.
+
+**Attention availability:** the own-family exclusion in the
+distraction proxies takes a policy: ``online_scored`` keys on when the
+scorer actually RAN (a backdated LLM rescore did not exist
+historically), ``retrospective_source`` (the paper-analysis default,
+recorded in the report) keys on text availability.  ``computed_at``
+alone is never used, since rescoring deliberately backdates it.
+
+**Pinned analysis configuration:** ``underreaction-analysis`` exposes
+``--relevance-method``, ``--relevance-model-version``,
+``--min-rel-score`` and repeatable ``--novel-edge-type``, and writes
+the complete news-sample contract into
+``underreaction_report.json`` — including the deterministic judgment
+tie-break (latest ``computed_at``; ties by method, model version,
+judgment id).
+
+**Lifecycle censoring fails CLOSED:** a horizon window is admissible
+only when the market is positively known open — a non-blocking status
+in force at the start, no blocking status inside, an active contract
+version at the start, no recorded resolution before the endpoint, and
+no blocking collector gap overlapping the window (an outage means
+lifecycle changes could have been missed).  Unknown coverage is
+censored, not assumed open.
+
+**Cluster refusal is per dimension:** a t-statistic requires at least
+five clusters in ITS dimension; the two-way statistic requires both,
+i.e. min(markets, days) >= 5.  Deficient dimensions are named in the
+inference note, and the wild-cluster bootstrap runs on the smaller
+clustering.
 
 **Model-availability discipline (screens):** an online-basis screen
 additionally requires the mode model to have EXISTED before the news
@@ -168,3 +202,39 @@ work before transfer results are used in claims.
   labelled backtests/replications with frozen scorers; `run-analysis`
   replays use this and record it in the run config and context
   coverage.
+
+
+## Paper -> DRC integration (PR C)
+
+Decision contexts carry a ``paper_state`` channel, populated when a
+fitted mode run is supplied (``run-analysis --mode-run-id``), with
+STRICT as-of semantics throughout: the liquidity mode is the ONLINE
+label of the latest bin fully closed before the decision; impact
+screens appear only when ``screen_available_at`` precedes the decision
+(online basis, deployment-gated per row; the as-of accessor now also
+requires an actual detected transition); the initial market response
+so far runs from the last pre-news close to the last close BEFORE the
+decision — both past observations, so it belongs to C; attention loads
+use the ONLINE relevance policy.  Features: the ``paper`` group
+(mode/age/prevalence, screen availability/count/probability, the
+contradiction flag, initial response, attention loads) with explicit
+missing flags; attribution gains ``liquidity_state``,
+``impactful_news`` and ``attention`` channels, and the feature-version
+hash changes so stale reasoning artifacts are refused (retrain
+required, by design).
+
+Gate tightening: PERSISTENT_NEWS_ADJUSTMENT is now incompatible with
+``impact_screen_contradiction`` — screens ran for the market and found
+NO impactful news, i.e. the market's own liquidity reaction
+contradicts a persistent-adjustment story.
+
+Ex-post outcomes live EXCLUSIVELY in the O layer
+(``analysis/outcomes.py``): realised post-decision drift per horizon
+with censoring and fresh-endpoint discipline, attached to DRC records
+as a final export pass after features, attributions, posteriors and
+counterfactuals are frozen; a structural test asserts no outcome key
+is a feature and no context/feature/reasoning module imports the
+outcome layer.  ``predicted_remaining_adjustment`` (a drift forecast
+from a model trained before the decision) is deliberately deferred: it
+requires a versioned, trained-before-decision forecast artifact and
+will arrive with the real-data reasoning work.

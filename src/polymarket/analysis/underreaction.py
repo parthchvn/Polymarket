@@ -54,10 +54,16 @@ MIN_MARKET_CLUSTERS = 5
 
 class MarketCensor:
     """Prediction markets converge mechanically at resolution, so a
-    horizon window is admissible only if the SAME contract stayed open
-    and tradeable through the endpoint: no resolved/closed/disabled
-    status effective inside the window, no contract-version change,
-    and the window ends before any recorded resolution time."""
+    horizon window is admissible only if the SAME contract is
+    POSITIVELY KNOWN to have stayed open and tradeable through the
+    endpoint.  "No recorded closure" is not "certified open": a window
+    fails closed unless (a) a non-blocking status was in force at the
+    start, (b) no blocking status takes effect inside the window,
+    (c) an active contract version existed at the start and did not
+    change mid-window, (d) the window ends before any recorded
+    resolution time, and (e) no blocking collector gap for the market
+    overlaps the window (a collection outage means lifecycle changes
+    could have been missed)."""
 
     def __init__(self, conn: sqlite3.Connection):
         self._timeline: dict[str, list[tuple[float, bool]]] = {}
@@ -75,6 +81,16 @@ class MarketCensor:
             self._timeline.setdefault(
                 row["condition_id"], []
             ).append((float(row["effective_from"]), blocking))
+        self._gaps: dict[str, list[tuple[float, float]]] = {}
+        for row in conn.execute(
+            "SELECT object_id, gap_start, gap_end FROM collector_gaps "
+            "WHERE object_id IS NOT NULL"
+        ):
+            self._gaps.setdefault(row["object_id"], []).append(
+                (float(row["gap_start"]),
+                 float(row["gap_end"]) if row["gap_end"] is not None
+                 else float("inf"))
+            )
         for row in conn.execute(
             "SELECT m.condition_id, v.effective_from, v.resolution_time "
             "FROM contract_versions v "
@@ -102,25 +118,34 @@ class MarketCensor:
         from bisect import bisect_right as _br
 
         timeline = self._timeline.get(condition_id, [])
-        # the status in force at the window START must be tradeable ...
+        # (a) a status must be POSITIVELY in force at the start, and it
+        # must be non-blocking — unknown lifecycle fails closed
         index = _br([t for t, _ in timeline], start) - 1
-        if index >= 0 and timeline[index][1]:
+        if index < 0:
+            return False           # no known status at the window start
+        if timeline[index][1]:
             return False           # already blocked when the window opens
-        # ... and no blocking status may take effect inside the window
+        # (b) no blocking status may take effect inside the window
         for effective_from, blocking in timeline[index + 1:]:
             if effective_from > end:
                 break
             if blocking:
                 return False
+        # (c) an active contract version at the start, unchanged inside
         versions = self._versions.get(condition_id, [])
-        if versions and (
-            bisect_left(versions, start + 1e-9)
-            != _br(versions, end)
-        ):
+        if not versions or bisect_left(versions, start + 1e-9) == 0:
+            return False           # no known contract at the start
+        if bisect_left(versions, start + 1e-9) != _br(versions, end):
             return False           # the contract changed mid-window
+        # (d) recorded resolution before the endpoint
         resolution = self._resolution.get(condition_id)
         if resolution is not None and end >= resolution:
             return False
+        # (e) blocking collector gaps overlapping the window: the
+        # lifecycle could have changed unobserved
+        for gap_start, gap_end in self._gaps.get(condition_id, []):
+            if gap_start <= end and gap_end >= start:
+                return False
         return True
 
     def time_to_resolution(
@@ -369,15 +394,29 @@ class DriftRegressionResult:
 
     @property
     def inference_admissible(self) -> bool:
-        return self.cluster_counts.get("market", 0)             >= MIN_MARKET_CLUSTERS
+        return min(
+            self.cluster_counts.get("market", 0),
+            self.cluster_counts.get("utc_day", 0),
+        ) >= MIN_MARKET_CLUSTERS
+
+    def _dimension_admissible(self, name: str) -> bool:
+        if name == "two_way":
+            return self.inference_admissible
+        return self.cluster_counts.get(name, 0) >= MIN_MARKET_CLUSTERS
 
     def as_dict(self) -> dict:
-        t_news = None
-        if self.inference_admissible:
-            t_news = {
-                name: (self.beta_news / se if se > 0 else None)
-                for name, se in self.se_news_by_cluster.items()
-            }
+        # per-dimension refusal: a t-statistic is reported only for
+        # clusterings with enough groups; two-way needs BOTH
+        t_news = {
+            name: (
+                self.beta_news / se
+                if se > 0 and self._dimension_admissible(name)
+                else None
+            )
+            for name, se in self.se_news_by_cluster.items()
+        }
+        if all(value is None for value in t_news.values()):
+            t_news = None
         return {
             "horizon_seconds": self.horizon_seconds,
             "spec": self.spec,
@@ -478,16 +517,26 @@ def run_drift_regressions(
             clusters={"market": market_labels, "utc_day": days_arr},
         )
         n_markets = fit["cluster_counts"]["market"]
+        n_days = fit["cluster_counts"]["utc_day"]
         note = None
         wild_p = None
-        if n_markets < MIN_MARKET_CLUSTERS:
+        deficient = [
+            f"{name}={count}" for name, count in (
+                ("market", n_markets), ("utc_day", n_days)
+            ) if count < MIN_MARKET_CLUSTERS
+        ]
+        if deficient:
             note = (
-                f"only {n_markets} market clusters (<"
-                f"{MIN_MARKET_CLUSTERS}): t-statistics refused; wild-"
-                "cluster bootstrap p reported instead"
+                f"cluster counts too small ({', '.join(deficient)} < "
+                f"{MIN_MARKET_CLUSTERS}): t-statistics refused for "
+                "those dimensions and two-way; wild-cluster bootstrap "
+                "p (on the smaller clustering) reported instead"
+            )
+            wild_labels = (
+                market_labels if n_markets <= n_days else days_arr
             )
             wild_p = wild_cluster_bootstrap_p(
-                y_arr, X, market_labels, coef_index=1
+                y_arr, X, wild_labels, coef_index=1
             )
         block = moving_block_bootstrap(
             y_arr, X, days_arr, coef_index=1,

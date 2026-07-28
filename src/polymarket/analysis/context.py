@@ -30,6 +30,7 @@ class DecisionContext:
     articles: list[dict]
     event_families: list[dict]
     relevance: list[dict]
+    paper_state: dict = field(default_factory=dict)
     coverage: dict = field(default_factory=dict)
 
 
@@ -43,6 +44,7 @@ def build_context(
     *,
     market_state_lookback: float = 86400.0,
     relevance_availability: str = "online_scored",
+    mode_run_id: str | None = None,
 ) -> DecisionContext:
     t = episode.anchor_time
     contract = None
@@ -101,6 +103,12 @@ def build_context(
         context.relevance = _rows(snapshot_rows)
         context.coverage["relevance_version_fallback"] = version_fallback
         context.coverage["relevance_availability"] = relevance_availability
+    from polymarket.analysis.paper_features import build_paper_state
+
+    context.paper_state = build_paper_state(
+        reader._conn, episode.condition_id, t, mode_run_id
+    )
+    context.coverage["paper_mode_run_id"] = mode_run_id
     assert_no_future_information(
         {
             "contract": context.contract,
