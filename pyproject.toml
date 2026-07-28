@@ -19,6 +19,8 @@ dependencies = [
 llm = [
     "ollama",
     "pydantic>=2",
+    "googlenewsdecoder",
+    "trafilatura",
 ]
 dev = [
     "pytest>=8",

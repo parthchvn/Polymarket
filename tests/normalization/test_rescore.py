@@ -681,3 +681,90 @@ def test_backfill_queue_is_prioritized(tmp_path):
         min_body_chars=0, relevance_filter=False,
     )
     assert relaxed["articles_pending"] == 2          # C and D remain
+
+
+def test_download_article_bodies_provenance_and_honesty(tmp_path):
+    """Headline-placeholder articles get real bodies with full
+    provenance; failures are recorded once and never retried; and a
+    claim extracted from a late-downloaded body carries the DOWNLOAD
+    time as availability, not the RSS observation time."""
+    from polymarket.collection.article_bodies import (
+        download_article_bodies,
+    )
+    from polymarket.contracts.schema import init_db
+    from polymarket.normalization.news import backfill_llm_claims
+
+    conn = init_db(str(tmp_path / "bodies.sqlite"), description="b")
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO markets (market_id, condition_id, "
+        "question, raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-d', '0xd', 'Q?', 1, 0, 'h', 'p', 2, ?)", (now,),
+    )
+    for key, ts in (("good", 1000.0), ("blocked", 1001.0)):
+        conn.execute(
+            "INSERT INTO news_articles (article_id, source_id, "
+            "source_url, source_published_at, first_observed_at, "
+            "download_completed_at, timestamp_source, "
+            "timestamp_confidence, headline, body, content_hash, "
+            "raw_response_id, raw_record_index, raw_record_hash, "
+            "parser_version, schema_version, normalized_at) VALUES "
+            "(?, 's', ?, ?, ?, ?, 'feed', 0.8, ?, ?, ?, 1, 0, 'h', "
+            "'p', 1, ?)",
+            (f"art-{key}", f"https://example.com/{key}", ts, ts, ts,
+             f"headline {key}", f"headline {key}",   # body == headline
+             f"ch-{key}", now),
+        )
+    conn.commit()
+
+    def fake_fetcher(url, timeout=25.0):
+        if "blocked" in url:
+            raise ValueError("503 bot wall")
+        return url, "<html>full page</html>", "real article text " * 40
+
+    report = download_article_bodies(conn, fetcher=fake_fetcher)
+    assert report["downloaded"] == 1
+    assert report["failed"] == 1
+    assert "503" in report["failed_examples"][0]
+    row = conn.execute(
+        "SELECT body, download_completed_at FROM news_articles "
+        "WHERE article_id = 'art-good'"
+    ).fetchone()
+    assert row[0].startswith("real article text")
+    assert row[1] > now                      # honest download time
+    # provenance: both attempts recorded as raw responses
+    attempts = conn.execute(
+        "SELECT COUNT(*) FROM raw_responses "
+        "WHERE collector = 'news:article-body'"
+    ).fetchone()[0]
+    assert attempts == 2
+    # a second run retries NOTHING
+    rerun = download_article_bodies(conn, fetcher=fake_fetcher)
+    assert rerun["downloaded"] == 0 and rerun["failed"] == 0
+    assert rerun["skipped_previous_attempts"] >= 1
+
+    # availability honesty flows into claim extraction
+    class E:
+        version = "body-v1"
+
+        def extract(self, headline, body):
+            assert body.startswith("real article text")
+            return [{"claim_text": "from body", "entities": [],
+                     "quantities": [], "confidence": 0.9}]
+
+    class S:
+        method, version = "ollama_llm", "s1"
+
+        def score(self, *a):
+            return {"rel_class": "indirect", "rel_score": 0.6,
+                    "direction": 0.0, "evidence": {}}
+
+    backfill_llm_claims(
+        conn, E(), S(), relevance_filter=False, min_body_chars=100,
+    )
+    claim = conn.execute(
+        "SELECT first_available_at FROM news_claims "
+        "WHERE extractor_version = 'body-v1'"
+    ).fetchone()
+    assert claim[0] > now       # download time, not RSS time (1000.0)

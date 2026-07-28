@@ -268,6 +268,34 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch_article_bodies(args) -> int:
+    import json as _json
+
+    _require_db(args.db)
+    from polymarket.contracts.schema import connect
+
+    conn = connect(args.db)
+    try:
+        import googlenewsdecoder  # noqa: F401
+        import trafilatura  # noqa: F401
+
+        from polymarket.collection.article_bodies import (
+            download_article_bodies,
+        )
+    except ImportError as exc:
+        raise SystemExit(
+            'error: install news dependencies with '
+            'python -m pip install -e ".[llm]"'
+        ) from exc
+    report = download_article_bodies(
+        conn, limit=args.limit, timeout=args.timeout,
+        order=args.order,
+    )
+    print(_json.dumps(report, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
 def cmd_extract_claims(args) -> int:
     import json as _json
 
@@ -788,6 +816,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "fetch-article-bodies",
+        help="download real article text for headline-only RSS rows "
+             "(google-news decode + publisher fetch + main-text "
+             "extraction); every attempt recorded, failures skipped",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--timeout", type=float, default=25.0)
+    p.add_argument("--order", default="newest",
+                   choices=["newest", "oldest"])
+    p.set_defaults(func=cmd_fetch_article_bodies)
 
     p = sub.add_parser(
         "extract-claims",
