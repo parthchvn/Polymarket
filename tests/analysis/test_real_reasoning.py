@@ -153,7 +153,8 @@ def test_gate_flag_reflects_split_results():
     data = _planted_world(seed=11)
     report = evaluate_latent_reasoning(data, latent_dim=2, seed=13)
     expected = all(
-        b["latent_beats_c_only"] for b in report["splits"].values()
+        b["latent_beats_c_only"] and b["latent_beats_null"]
+        for b in report["splits"].values()
         if b["status"] == "evaluated"
     )
     assert report["gate_1_predictive_value"] == expected
@@ -187,6 +188,39 @@ def test_cluster_stability_high_on_strong_structure():
     assert cluster_stability(Z, Z + rng.normal(
         scale=0.05, size=Z.shape
     ), 3) > 0.95
+
+
+def test_cluster_stability_invariant_to_latent_rotation():
+    """Rank-K latents are identified only up to sign/rotation across
+    seeds; the SAME partition in a mirrored coordinate frame must
+    score as fully stable (the real-data 0.0 bug)."""
+    rng = np.random.default_rng(2)
+    centers = np.array([[4, 0], [-4, 0], [0, 4]])
+    Z = np.vstack([
+        center + rng.normal(scale=0.3, size=(80, 2))
+        for center in centers
+    ])
+    theta = 2.1
+    rotation = np.array([
+        [np.cos(theta), -np.sin(theta)],
+        [np.sin(theta), np.cos(theta)],
+    ])
+    Z_rotated = (-Z) @ rotation.T          # sign flip + rotation
+    assert cluster_stability(Z, Z_rotated, 3) > 0.95
+
+
+def test_gate_requires_beating_null_not_just_c_only():
+    """Pure-noise labels: the latent model may edge out the full-rank
+    baseline through regularization, but nothing beats the base rate
+    — the gate must NOT pass, and the note must say why."""
+    rng = np.random.default_rng(6)
+    data = _planted_world(seed=6)
+    data["y"] = rng.integers(0, 2, size=len(data["y"])).astype(float)
+    report = evaluate_latent_reasoning(data, latent_dim=2, seed=13)
+    assert report["status"] == "evaluated"
+    for block in report["splits"].values():
+        assert "latent_beats_null" in block
+    assert report["gate_1_predictive_value"] is False
 
 
 def test_baseline_logistic_sane():
