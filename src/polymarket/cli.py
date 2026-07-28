@@ -292,6 +292,10 @@ def cmd_extract_claims(args) -> int:
         OllamaClaimExtractor(args.model),
         OllamaRelevanceScorer(args.model),
         limit=args.limit,
+        order=args.order,
+        min_body_chars=args.min_body_chars,
+        min_rel_score=args.min_rel_score,
+        relevance_filter=not args.no_relevance_filter,
     )
     print(_json.dumps(report, indent=2, sort_keys=True))
     conn.close()
@@ -795,6 +799,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="qwen3:8b")
     p.add_argument("--limit", type=int, default=None,
                    help="max NEW articles this run")
+    p.add_argument("--order", default="newest",
+                   choices=["newest", "oldest"])
+    p.add_argument("--min-body-chars", type=int, default=400,
+                   help="skip headline-only articles")
+    p.add_argument("--min-rel-score", type=float, default=0.03)
+    p.add_argument("--no-relevance-filter", action="store_true",
+                   help="extract regardless of rule-scored relevance")
     p.set_defaults(func=cmd_extract_claims)
 
     p = sub.add_parser(

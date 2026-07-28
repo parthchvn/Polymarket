@@ -465,34 +465,71 @@ def market_contract_rows(conn: sqlite3.Connection) -> list:
     ).fetchall()
 
 
+RELEVANT_PRIORITY_CLASSES = (
+    "supports_positive", "supports_negative", "indirect",
+)
+
+
 def backfill_llm_claims(
     conn: sqlite3.Connection,
     extractor,
     scorer,
     *,
     limit: int | None = None,
+    order: str = "newest",
+    min_body_chars: int = 400,
+    min_rel_score: float = 0.03,
+    relevance_filter: bool = True,
 ) -> dict:
     """Run an (LLM) claim extractor over EXISTING articles that have no
     claims from this extractor version — normalization only extracts
     on first article insert, so body-level LLM extraction needs this
     backfill for articles first normalized by the rule extractor.
     Resumable: already-covered articles are skipped; ``limit`` bounds
-    NEW extractions per run."""
+    NEW extractions per run.
+
+    At minutes-per-article LLM cost against a growing feed, the queue
+    is PRIORITIZED, not exhaustive: newest first (fresh news feeds the
+    online screens; stale generic RSS does not), only articles with a
+    real body (headline-only RSS gains nothing from body extraction),
+    and only articles whose cheap rule-scored claims already look
+    plausibly relevant to some market (``min_rel_score`` on any
+    judgment, or any judgment in the relevant classes).  Each filter
+    can be relaxed via arguments."""
     import time as _time
 
     version = getattr(extractor, "version", None)
-    rows = conn.execute(
-        """
-        SELECT a.article_id, a.headline, a.body, a.first_observed_at
-        FROM news_articles a
-        WHERE NOT EXISTS (
+    conditions = [
+        """NOT EXISTS (
             SELECT 1 FROM news_claims c
             WHERE c.article_id = a.article_id
               AND c.extractor_version = ?
+        )""",
+        "LENGTH(COALESCE(a.body, '')) >= ?",
+    ]
+    params: list = [version, min_body_chars]
+    if relevance_filter:
+        placeholders = ",".join("?" for _ in RELEVANT_PRIORITY_CLASSES)
+        conditions.append(
+            f"""EXISTS (
+            SELECT 1 FROM news_claims c
+            JOIN relevance_judgments r ON r.claim_id = c.claim_id
+            WHERE c.article_id = a.article_id
+              AND (r.rel_score >= ?
+                   OR r.rel_class IN ({placeholders}))
+        )"""
         )
-        ORDER BY a.first_observed_at
+        params.append(min_rel_score)
+        params.extend(RELEVANT_PRIORITY_CLASSES)
+    direction = "DESC" if order == "newest" else "ASC"
+    rows = conn.execute(
+        f"""
+        SELECT a.article_id, a.headline, a.body, a.first_observed_at
+        FROM news_articles a
+        WHERE {" AND ".join(conditions)}
+        ORDER BY a.first_observed_at {direction}
         """,
-        (version,),
+        params,
     ).fetchall()
     result = NormalizationResult(
         raw_response_id=-1, collector="backfill", endpoint="backfill"
@@ -500,18 +537,29 @@ def backfill_llm_claims(
     markets = market_contract_rows(conn)
     now = _time.time()
     processed = 0
+    failures: list[str] = []
     for row in rows:
         if limit is not None and processed >= limit:
             break
-        ingest_claims_for_article(
-            conn, result,
-            art_id=row["article_id"],
-            headline=row["headline"] or "",
-            body=row["body"] or "",
-            first_observed_at=float(row["first_observed_at"]),
-            now=now, markets=markets,
-            extractor=extractor, scorer=scorer,
-        )
+        try:
+            ingest_claims_for_article(
+                conn, result,
+                art_id=row["article_id"],
+                headline=row["headline"] or "",
+                body=row["body"] or "",
+                first_observed_at=float(row["first_observed_at"]),
+                now=now, markets=markets,
+                extractor=extractor, scorer=scorer,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:                # noqa: BLE001
+            # a poison article (degenerate generation, parse failure)
+            # must not block the queue: record it, roll back its
+            # partial writes, move on
+            conn.rollback()
+            failures.append(f"{row['article_id']}: {exc}")
+            continue
         processed += 1
         # commit PER ARTICLE: LLM extraction can take minutes per
         # article, so progress must be durable and interruption must
@@ -521,6 +569,15 @@ def backfill_llm_claims(
     return {
         "articles_pending": len(rows),
         "articles_processed": processed,
+        "articles_failed": len(failures),
+        "failed_examples": failures[:5],
         "inserted": dict(result.inserted),
         "extractor_version": version,
+        "queue_policy": {
+            "order": order,
+            "min_body_chars": min_body_chars,
+            "relevance_filter": relevance_filter,
+            "min_rel_score": min_rel_score if relevance_filter
+            else None,
+        },
     }
