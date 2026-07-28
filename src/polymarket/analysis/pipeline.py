@@ -106,10 +106,13 @@ def run_reasoning_pipeline(
                 "WHERE condition_id = ? AND bin_seconds = ?",
                 (condition_id, bin_seconds),
             ).fetchone()[0]
-            written += build_liquidity_bars(
-                conn, condition_id, start=last,
-                config=LiquidityBarConfig(bin_seconds=bin_seconds),
-            )
+            try:
+                written += build_liquidity_bars(
+                    conn, condition_id, start=last,
+                    config=LiquidityBarConfig(bin_seconds=bin_seconds),
+                )
+            except ValueError:
+                continue    # no observations for this condition yet
         complete = conn.execute(
             "SELECT COUNT(*) FROM liquidity_bars "
             "WHERE bin_seconds = ? AND coverage_complete = 1",
@@ -122,6 +125,18 @@ def run_reasoning_pipeline(
     report["data_readiness"]["complete_bars"] = bar_detail
 
     # ---- 4. jump model ---------------------------------------------------
+    # prequential bookkeeping: the run fitted LAST cycle is the one
+    # allowed to screen THIS window's news online (its training ended
+    # before the news existed); the run fitted now screens the NEXT
+    # window.  Refit-then-screen-with-the-newest would make every
+    # online screen honestly refuse as model_unavailable, forever.
+    previous_run = conn.execute(
+        "SELECT mode_run_id, fit_cutoff FROM liquidity_mode_runs "
+        "ORDER BY fit_cutoff DESC, created_at DESC LIMIT 1"
+    ).fetchone()
+    previous_mode_run_id = (
+        previous_run["mode_run_id"] if previous_run else None
+    )
     mode_run_id = None
     if "modes" in skip:
         _stage(report, "liquidity_modes", "skipped")
@@ -146,7 +161,7 @@ def run_reasoning_pipeline(
                    reason=str(exc))
 
     # ---- 5. impact screens -----------------------------------------------
-    if mode_run_id is None:
+    if mode_run_id is None and previous_mode_run_id is None:
         _stage(report, "impact_screens", "skipped",
                reason="no fitted mode run")
     else:
@@ -154,16 +169,29 @@ def run_reasoning_pipeline(
             screen_news_impact,
         )
 
-        counters = {}
-        for basis in ("online_filtered", "retrospective_smoothed"):
-            counters[basis] = screen_news_impact(
-                conn, mode_run_id, assignment_basis=basis
-            )
-        _stage(report, "impact_screens", "ok", **{
-            basis: {k: v for k, v in c.items()
-                    if isinstance(v, int)}
-            for basis, c in counters.items()
-        })
+        counters: dict = {}
+        # ONLINE basis: the previous cycle's model — fitted before
+        # this window's news — does the online screening
+        online_run = previous_mode_run_id or mode_run_id
+        counters["online_filtered"] = screen_news_impact(
+            conn, online_run, assignment_basis="online_filtered"
+        )
+        # RETROSPECTIVE basis: the freshest model, by definition
+        retro_run = mode_run_id or previous_mode_run_id
+        counters["retrospective_smoothed"] = screen_news_impact(
+            conn, retro_run,
+            assignment_basis="retrospective_smoothed",
+        )
+        _stage(
+            report, "impact_screens", "ok",
+            online_screened_by=online_run,
+            retrospective_screened_by=retro_run,
+            **{
+                basis: {k: v for k, v in c.items()
+                        if isinstance(v, int)}
+                for basis, c in counters.items()
+            },
+        )
 
     # ---- 6. replay + reasoning + DRC + outcomes --------------------------
     if "analysis" in skip:
