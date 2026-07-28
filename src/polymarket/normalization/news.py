@@ -500,18 +500,29 @@ def backfill_llm_claims(
     markets = market_contract_rows(conn)
     now = _time.time()
     processed = 0
+    failures: list[str] = []
     for row in rows:
         if limit is not None and processed >= limit:
             break
-        ingest_claims_for_article(
-            conn, result,
-            art_id=row["article_id"],
-            headline=row["headline"] or "",
-            body=row["body"] or "",
-            first_observed_at=float(row["first_observed_at"]),
-            now=now, markets=markets,
-            extractor=extractor, scorer=scorer,
-        )
+        try:
+            ingest_claims_for_article(
+                conn, result,
+                art_id=row["article_id"],
+                headline=row["headline"] or "",
+                body=row["body"] or "",
+                first_observed_at=float(row["first_observed_at"]),
+                now=now, markets=markets,
+                extractor=extractor, scorer=scorer,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:                # noqa: BLE001
+            # a poison article (degenerate generation, parse failure)
+            # must not block the queue: record it, roll back its
+            # partial writes, move on
+            conn.rollback()
+            failures.append(f"{row['article_id']}: {exc}")
+            continue
         processed += 1
         # commit PER ARTICLE: LLM extraction can take minutes per
         # article, so progress must be durable and interruption must
@@ -521,6 +532,8 @@ def backfill_llm_claims(
     return {
         "articles_pending": len(rows),
         "articles_processed": processed,
+        "articles_failed": len(failures),
+        "failed_examples": failures[:5],
         "inserted": dict(result.inserted),
         "extractor_version": version,
     }

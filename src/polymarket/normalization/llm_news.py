@@ -155,6 +155,27 @@ def _source_entities(text: str) -> list[str]:
     return entities
 
 
+MAX_EXTRACTION_RESPONSE_CHARS = 200_000
+MAX_CLAIMS_PER_ARTICLE = 12
+
+
+def cap_extracted_claims(claims: list) -> list:
+    """Schema-constrained decoding at temperature 0 can degenerate
+    into enormous repetitive claim arrays; a real article rarely
+    yields more than a dozen atomic claims worth scoring (each claim
+    also costs one relevance call per market downstream).  Keep the
+    highest-confidence claims up to the cap, deduplicated by text."""
+    seen: set[str] = set()
+    unique = []
+    for claim in claims:
+        key = claim.claim_text.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(claim)
+    unique.sort(key=lambda c: -float(c.confidence or 0))
+    return unique[:MAX_CLAIMS_PER_ARTICLE]
+
+
 class OllamaClaimExtractor:
     """Extract atomic factual claims using a local Ollama model."""
 
@@ -217,18 +238,23 @@ ARTICLE BODY:
             keep_alive="30m",
             options={
                 "temperature": 0,
-                "num_ctx": 4096,
+                "num_ctx": 8192,    # prompt + schema must actually fit
             },
         )
 
-        parsed = ClaimExtractionResult.model_validate_json(
-            response.message.content
-        )
+        content = response.message.content or ""
+        if len(content) > MAX_EXTRACTION_RESPONSE_CHARS:
+            raise ValueError(
+                f"degenerate extraction response "
+                f"({len(content)} chars); skipping article"
+            )
+        parsed = ClaimExtractionResult.model_validate_json(content)
 
         output: list[dict] = []
         source_text = f"{headline}\n{body_excerpt}"
+        source_entity_list = list(_source_entities(source_text))
 
-        for claim in parsed.claims:
+        for claim in cap_extracted_claims(list(parsed.claims)):
             claim_text = claim.claim_text.strip()
             supporting_span = claim.supporting_span.strip()
             claim_source = f"{claim_text}\n{supporting_span}"
@@ -241,7 +267,7 @@ ARTICLE BODY:
 
             entity_keys = {entity.lower() for entity in entities}
 
-            for entity in _source_entities(source_text):
+            for entity in source_entity_list:
                 if (
                     entity.lower() in claim_source.lower()
                     and entity.lower() not in entity_keys

@@ -552,12 +552,35 @@ def test_backfill_commits_per_article(tmp_path):
             return {"rel_class": "background", "rel_score": 0.3,
                     "direction": 0.0, "evidence": {}}
 
-    with pytest.raises(RuntimeError):
-        backfill_llm_claims(conn, Crashing(), Scorer())
-    # the two completed articles survived via a SEPARATE connection
+    report = backfill_llm_claims(conn, Crashing(), Scorer())
+    # the poison article is recorded and SKIPPED, the queue advances
+    assert report["articles_failed"] == 1
+    assert report["articles_processed"] == 2
+    assert "ollama died" in report["failed_examples"][0]
+    # completed articles are durable via a SEPARATE connection
     other = _sq.connect(db)
     count = other.execute(
         "SELECT COUNT(*) FROM news_claims "
         "WHERE extractor_version = 'crash-v1'"
     ).fetchone()[0]
     assert count == 2
+
+
+def test_cap_extracted_claims_bounds_degenerate_output():
+    """Constrained decoding can degenerate into huge repetitive claim
+    arrays; the cap keeps the best dozen unique claims so one article
+    cannot burn minutes of CPU and hundreds of relevance calls."""
+    llm_news = pytest.importorskip("polymarket.normalization.llm_news")
+
+    class C:
+        def __init__(self, text, conf):
+            self.claim_text = text
+            self.confidence = conf
+
+    degenerate = [C("same claim", 0.5) for _ in range(5000)]
+    degenerate += [C(f"claim {i}", 0.5 + i / 100) for i in range(30)]
+    capped = llm_news.cap_extracted_claims(degenerate)
+    assert len(capped) == llm_news.MAX_CLAIMS_PER_ARTICLE
+    # highest-confidence unique claims kept
+    assert capped[0].claim_text == "claim 29"
+    assert len({c.claim_text for c in capped}) == len(capped)
