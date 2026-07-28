@@ -268,6 +268,35 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reasoning_pipeline(args) -> int:
+
+    _require_db(args.db)
+    from polymarket.analysis.pipeline import run_reasoning_pipeline
+
+    report = run_reasoning_pipeline(
+        args.db, args.output,
+        reasoning_model_path=args.reasoning_model,
+        end_time=args.end_time,
+        latent_dim=args.latent_dim,
+        annotation_batch_id=args.annotation_batch,
+        skip=set(args.skip or []),
+    )
+    print("stages:")
+    for name, stage in report["stages"].items():
+        detail = stage.get("reason", "")
+        print(f"  {name}: {stage['status']}"
+              + (f" ({detail})" if detail else ""))
+    print("gates:")
+    for name, gate in report["gates"].items():
+        print(f"  {name}: {gate['status']}"
+              + (f" passed={gate['passed']}" if "passed" in gate
+                 else "")
+              + (f" ({gate.get('reason','')})"
+                 if gate.get("reason") else ""))
+    print(f"acceptance report: {report['report_path']}")
+    return 0
+
+
 def cmd_export_annotation_batch(args) -> int:
     import json as _json
     import os as _os
@@ -725,6 +754,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "reasoning-pipeline",
+        help="one command: normalize -> bars -> modes -> screens -> "
+             "replay/DRC/O -> underreaction -> latent eval -> "
+             "acceptance-gate report",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--reasoning-model", default=None,
+                   help="trained reasoning artifact; omit for "
+                        "Layer-1-only analysis")
+    p.add_argument("--end-time", type=float, default=None)
+    p.add_argument("--latent-dim", type=int, default=8)
+    p.add_argument("--annotation-batch", default=None,
+                   help="pin gate 2 to a specific batch (default: "
+                        "latest imported)")
+    p.add_argument("--skip", action="append", default=None,
+                   choices=["normalize", "modes", "analysis",
+                            "underreaction"],
+                   help="repeatable: stages to skip")
+    p.set_defaults(func=cmd_reasoning_pipeline)
 
     p = sub.add_parser(
         "export-annotation-batch",
