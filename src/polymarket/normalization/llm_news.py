@@ -298,7 +298,7 @@ class OllamaRelevanceScorer:
 
     def __init__(self, model: str = "qwen3:8b") -> None:
         self.model = model
-        self.version = f"ollama-{model}-relevance-v1"
+        self.version = f"ollama-{model}-relevance-v2"  # v2: indirect/background/irrelevant guidance
 
     def score(
         self,
@@ -329,9 +329,18 @@ Rules:
    positive supports the positive proposition;
    negative supports the negative proposition.
 6. Do not confuse news importance with contract relevance.
-7. A claim can be important but irrelevant to the exact resolution rule.
-8. supporting_rule_span should quote exact wording from the question or rules.
-9. Return only the required structured output.
+7. Use indirect when a claim meaningfully informs the likelihood of the
+   proposition through intentions, capabilities, military readiness,
+   resource constraints, diplomacy, escalation, negotiations, or planning,
+   even when it does not itself satisfy the resolution condition.
+8. Use background for topically related information that provides little
+   directional evidence about the proposition.
+9. Use irrelevant only when there is no plausible informational or causal
+   connection to the proposition.
+10. Do not classify a claim as irrelevant merely because it does not directly
+    satisfy the resolution condition.
+11. supporting_rule_span should quote exact wording from the question or rules.
+12. Return only the required structured output.
 
 CLAIM:
 {claim_text}

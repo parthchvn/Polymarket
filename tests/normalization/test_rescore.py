@@ -257,3 +257,183 @@ def test_two_scorers_never_collide(conn):
         "SELECT COUNT(*) FROM relevance_judgments"
     ).fetchone()[0]
     assert n == 4                                  # both runs fully stored
+
+
+def test_relevance_prompt_version_bumped_with_guidance():
+    """The v2 prompt (indirect/background/irrelevant guidance) must be
+    reflected in the model version so v1 and v2 judgments never mix
+    silently."""
+    llm_news = pytest.importorskip("polymarket.normalization.llm_news")
+    source = open(llm_news.__file__).read()
+    assert "Use indirect when a claim meaningfully informs" in source
+    assert "merely because it does not directly" in source
+    assert 'relevance-v2"' in source
+    assert 'relevance-v1"' not in source
+
+
+def test_limited_claim_extractor_budget_and_resume(conn):
+    from polymarket.normalization.news import LimitedClaimExtractor
+
+    class Fake:
+        version = "fake-x-1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, headline, body):
+            self.calls += 1
+            return [{"claim_text": f"claim about {headline}",
+                     "entities": [], "quantities": []}]
+
+    inner = Fake()
+    limited = LimitedClaimExtractor(inner, conn, limit=2)
+    articles = [(f"headline {i}", f"body {i}") for i in range(5)]
+    outputs = [limited.extract(h, b) for h, b in articles]
+    assert inner.calls == 2                       # budget respected
+    assert limited.extracted == 2 and limited.deferred == 3
+    assert outputs[0] and not outputs[2]
+    # simulate persistence of the two extracted articles, then resume:
+    # they are skipped without token spend and the budget covers new ones
+    now = time.time()
+    for i in range(2):
+        conn.execute(
+            "INSERT INTO news_articles (article_id, source_id, "
+            "source_url, source_published_at, first_observed_at, "
+            "download_completed_at, timestamp_source, "
+            "timestamp_confidence, headline, body, content_hash, "
+            "raw_response_id, raw_record_index, raw_record_hash, "
+            "parser_version, schema_version, normalized_at) VALUES "
+            "(?, 's', 'u', 1, 1, 1, 'feed', 0.8, ?, ?, ?, 1, 0, 'h', "
+            "'p', 2, ?)",
+            (f"art-lim-{i}", f"headline {i}", f"body {i}",
+             f"ch-lim-{i}", now),
+        )
+        conn.execute(
+            "INSERT INTO news_claims (claim_id, article_id, claim_text, "
+            "entities_json, quantities_json, first_available_at, "
+            "extractor_version, confidence) VALUES (?, ?, 'c', '[]', "
+            "'[]', 1, 'fake-x-1', 0.9)",
+            (f"cl-lim-{i}", f"art-lim-{i}"),
+        )
+    conn.commit()
+    resumed = LimitedClaimExtractor(Fake(), conn, limit=2)
+    for headline, body in articles:
+        resumed.extract(headline, body)
+    assert resumed.skipped_existing == 2          # no re-spend
+    assert resumed.extracted == 2                 # budget on NEW articles
+    assert resumed.deferred == 1
+
+
+def _insert_article_claim(conn, key, text, ts):
+    now = time.time()
+    conn.execute(
+        "INSERT INTO news_articles (article_id, source_id, source_url, "
+        "source_published_at, first_observed_at, download_completed_at, "
+        "timestamp_source, timestamp_confidence, headline, body, "
+        "content_hash, raw_response_id, raw_record_index, "
+        "raw_record_hash, parser_version, schema_version, normalized_at)"
+        " VALUES (?, 's', 'u', ?, ?, ?, 'feed', 0.8, ?, ?, ?, 1, 0, "
+        "'h', 'p', 1, ?)",
+        (f"art-{key}", ts, ts, ts, text, text, f"ch-{key}", now),
+    )
+    conn.execute(
+        "INSERT INTO news_claims (claim_id, article_id, claim_text, "
+        "entities_json, quantities_json, first_available_at, "
+        "extractor_version, confidence) VALUES (?, ?, ?, '[]', '[]', "
+        "?, 'x', 0.9)",
+        (f"claim-{key}", f"art-{key}", text, ts),
+    )
+    conn.execute(
+        "INSERT INTO event_families (event_family_id, label, "
+        "earliest_available_at, created_by, created_at) VALUES "
+        "(?, ?, ?, 'test', ?)", (f"fam-{key}", key, ts, now),
+    )
+    conn.execute(
+        "INSERT INTO claim_edges (edge_id, claim_id, event_family_id, "
+        "edge_type, effective_from, evidence, confidence) VALUES "
+        "(?, ?, ?, 'new', ?, 'k', 0.5)",
+        (f"edge-{key}", f"claim-{key}", f"fam-{key}", ts),
+    )
+
+
+class _CannedOllama:
+    """Deterministic stand-in for the Ollama transport: returns the
+    class the v2 guidance requires for each labelled example."""
+
+    CASES = {
+        "Netanyahu and Trump meet to discuss Iran strategy":
+            {"rel_class": "indirect", "rel_score": 0.7,
+             "direction": 0.2,
+             "reasoning_summary": "diplomacy informs likelihood"},
+        "US munitions stockpile shortfall may constrain operations":
+            {"rel_class": "indirect", "rel_score": 0.6,
+             "direction": -0.2,
+             "reasoning_summary": "capability constraint"},
+        "State funeral held for former minister":
+            {"rel_class": "irrelevant", "rel_score": 0.9,
+             "direction": 0.0,
+             "reasoning_summary": "no causal connection"},
+    }
+
+    def score(self, claim_text, question, rules_text):
+        payload = self.CASES[claim_text]
+        return {
+            "rel_class": payload["rel_class"],
+            "rel_score": payload["rel_score"],
+            "direction": payload["direction"],
+            "evidence": {
+                "reasoning_summary": payload["reasoning_summary"],
+            },
+        }
+
+    method = "ollama_llm"
+    version = "canned-relevance-v2"
+
+
+def test_labelled_examples_not_marked_irrelevant(conn):
+    """The advisor's regression cases: indirect evidence (diplomacy,
+    capability constraints) must never end up 'irrelevant'; a truly
+    unconnected story stays irrelevant.  Runs through the full rescore
+    persistence path with a canned scorer honouring the v2 contract."""
+    for i, text in enumerate(_CannedOllama.CASES):
+        _insert_article_claim(conn, f"reg-{i}", text, T0 + 100 + i)
+    conn.commit()
+    counters = rescore_news(conn, _CannedOllama(), method="ollama")
+    assert counters["scored"] == 3
+    classes = {
+        row[0]: row[1] for row in conn.execute(
+            "SELECT c.claim_text, r.rel_class FROM relevance_judgments r "
+            "JOIN news_claims c ON c.claim_id = r.claim_id "
+            "WHERE r.model_version = 'canned-relevance-v2'"
+        )
+    }
+    assert classes[
+        "Netanyahu and Trump meet to discuss Iran strategy"
+    ] == "indirect"
+    assert classes[
+        "US munitions stockpile shortfall may constrain operations"
+    ] == "indirect"
+    assert classes[
+        "State funeral held for former minister"
+    ] == "irrelevant"
+
+
+def test_limited_relevance_scorer_budget(conn):
+    from polymarket.normalization.news import LimitedRelevanceScorer
+
+    class Counting:
+        method, version = "fake", "f1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, *a):
+            self.calls += 1
+            return {"rel_class": "background", "rel_score": 0.5,
+                    "direction": 0.0, "evidence": {}}
+
+    inner = Counting()
+    limited = LimitedRelevanceScorer(inner, limit=2)
+    out = [limited.score("c", "q", "r") for _ in range(5)]
+    assert inner.calls == 2
+    assert out[2] is None and limited.deferred == 3

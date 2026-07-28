@@ -76,6 +76,77 @@ class RelevanceScorer(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class LimitedClaimExtractor:
+    """Budget wrapper for expensive (LLM) claim extractors.
+
+    * Articles that already carry claims from the SAME extractor
+      version are skipped without spending tokens, so repeated
+      ``normalize --news-llm`` runs are cheap and resumable.
+    * With ``limit=N``, at most N new articles are extracted this run;
+      the rest return no claims and are picked up by the next run —
+      the bounded-test workflow (``--llm-limit 10``).
+
+    The wrapper is keyed by content hash of (headline, body), matching
+    the article identity used by normalization.
+    """
+
+    def __init__(self, inner, conn, *, limit: int | None = None):
+        self._inner = inner
+        self._conn = conn
+        self._limit = limit
+        self.version = inner.version
+        self.extracted = 0
+        self.skipped_existing = 0
+        self.deferred = 0
+
+    def _already_extracted(self, headline: str, body: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM news_claims c
+            JOIN news_articles a ON a.article_id = c.article_id
+            WHERE a.headline = ? AND c.extractor_version = ?
+            LIMIT 1
+            """,
+            (headline, self.version),
+        ).fetchone()
+        return row is not None
+
+    def extract(self, headline: str, body: str) -> list[dict[str, Any]]:
+        if self._already_extracted(headline, body):
+            self.skipped_existing += 1
+            return []
+        if self._limit is not None and self.extracted >= self._limit:
+            self.deferred += 1
+            return []
+        claims = self._inner.extract(headline, body)
+        self.extracted += 1
+        return claims
+
+
+class LimitedRelevanceScorer:
+    """Budget wrapper for expensive (LLM) relevance scorers: at most
+    ``limit`` NEW scores per run; over-budget claims are skipped this
+    run and picked up by the next (rescore-news and batch skip-existing
+    make this resumable).  Separate from the claim-extraction budget so
+    extraction and scoring can be bounded independently."""
+
+    def __init__(self, inner, *, limit: int | None = None):
+        self._inner = inner
+        self._limit = limit
+        self.version = inner.version
+        self.method = getattr(inner, "method", "rule_keyword_overlap")
+        self.scored = 0
+        self.deferred = 0
+
+    def score(self, claim_text, question, rules_text):
+        if self._limit is not None and self.scored >= self._limit:
+            self.deferred += 1
+            return None                    # caller skips: no judgment
+        result = self._inner.score(claim_text, question, rules_text)
+        self.scored += 1
+        return result
+
+
 class RuleBasedClaimExtractor:
     """One claim per article: headline plus first sentence of the body."""
 
@@ -298,6 +369,8 @@ def normalize_news(
                 scored = scorer.score(
                     claim["claim_text"], market["question"], market["rules_text"]
                 )
+                if scored is None:
+                    continue        # scoring budget deferred this claim
                 novelty = 1.0 if edge_type == "new" else 0.3
                 model_version = getattr(
                     scorer, "version", RELEVANCE_MODEL_VERSION

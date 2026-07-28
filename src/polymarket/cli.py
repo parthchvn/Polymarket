@@ -90,6 +90,18 @@ def cmd_normalize(args: argparse.Namespace) -> int:
         relevance_scorer = OllamaRelevanceScorer(args.llm_model)
 
     conn = connect(args.db)
+    if claim_extractor is not None:
+        from polymarket.normalization.news import (
+            LimitedClaimExtractor,
+            LimitedRelevanceScorer,
+        )
+
+        claim_extractor = LimitedClaimExtractor(
+            claim_extractor, conn, limit=args.llm_limit
+        )
+        relevance_scorer = LimitedRelevanceScorer(
+            relevance_scorer, limit=args.llm_score_limit
+        )
     results = Normalizer(
         conn,
         claim_extractor=claim_extractor,
@@ -103,6 +115,14 @@ def cmd_normalize(args: argparse.Namespace) -> int:
         unresolved += len(result.unresolved)
     diag = reconcile_roles(conn)
     print(f"normalized {len(results)} raw responses")
+    if claim_extractor is not None and hasattr(
+        claim_extractor, "extracted"
+    ):
+        print(
+            f"  llm extraction: {claim_extractor.extracted} articles "
+            f"extracted, {claim_extractor.skipped_existing} already "
+            f"done, {claim_extractor.deferred} deferred by --llm-limit"
+        )
     for table, n in sorted(inserted.items()):
         print(f"  {table}: {n} inserted")
     print(f"  unresolved records: {unresolved}")
@@ -593,6 +613,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-model",
         default="qwen3:8b",
         help="Ollama model used with --news-llm",
+    )
+    p.add_argument(
+        "--llm-limit",
+        type=int,
+        default=None,
+        help="with --news-llm: stop after the LLM has extracted this "
+             "many articles (resumable; for bounded test runs)",
+    )
+    p.add_argument(
+        "--llm-score-limit",
+        type=int,
+        default=None,
+        help="with --news-llm: independently bound the number of "
+             "relevance scores this run (resumable)",
     )
     p.set_defaults(func=cmd_normalize)
 
