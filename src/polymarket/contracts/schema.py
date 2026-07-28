@@ -565,9 +565,17 @@ LINEAGE_COLUMNS = ("raw_response_id", "parser_version", "schema_version", "norma
 
 
 def connect(path: str) -> sqlite3.Connection:
-    """Open a connection with required pragmas applied."""
-    conn = sqlite3.connect(path)
+    """Open a connection with required pragmas applied.
+
+    Concurrency: WAL journaling plus a 30s busy timeout so a collector
+    loop and an analysis/normalization process can share one database
+    — writers briefly queue instead of raising 'database is locked'
+    (short transactions interleave; nothing in this codebase holds a
+    write transaction for long)."""
+    conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
     for pragma in PRAGMAS:
         conn.execute(pragma)
     return conn

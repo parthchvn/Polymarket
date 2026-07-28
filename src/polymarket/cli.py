@@ -268,6 +268,36 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_extract_claims(args) -> int:
+    import json as _json
+
+    _require_db(args.db)
+    from polymarket.contracts.schema import connect
+
+    conn = connect(args.db)
+    try:
+        from polymarket.normalization.llm_news import (
+            OllamaClaimExtractor,
+            OllamaRelevanceScorer,
+        )
+    except ImportError as exc:
+        raise SystemExit(
+            'error: install LLM dependencies with '
+            'python -m pip install -e ".[llm]"'
+        ) from exc
+    from polymarket.normalization.news import backfill_llm_claims
+
+    report = backfill_llm_claims(
+        conn,
+        OllamaClaimExtractor(args.model),
+        OllamaRelevanceScorer(args.model),
+        limit=args.limit,
+    )
+    print(_json.dumps(report, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
 def cmd_reasoning_pipeline(args) -> int:
 
     _require_db(args.db)
@@ -754,6 +784,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "extract-claims",
+        help="LLM body-level claim extraction over EXISTING articles "
+             "(normalization only extracts on first insert; this "
+             "backfills, resumably)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--model", default="qwen3:8b")
+    p.add_argument("--limit", type=int, default=None,
+                   help="max NEW articles this run")
+    p.set_defaults(func=cmd_extract_claims)
 
     p = sub.add_parser(
         "reasoning-pipeline",

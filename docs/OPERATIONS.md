@@ -121,3 +121,21 @@ availability +1s so rescores supersede batch judgments in snapshots,
 while live-online analyses that must not pretend an LLM result
 predated its computation can order by `scored_at`.  The ollama method needs `pip install ollama` and a
 running Ollama server.
+
+
+## Concurrent access
+
+Connections use WAL with a 30s busy timeout: a collector loop and a
+short analysis command can share one database.  Long writers (LLM
+normalization holds a transaction per raw response, potentially for
+minutes) must NOT run against the collector's database.  Overnight
+pattern: the collector owns ``forward.sqlite`` exclusively; a work
+database accumulates via snapshot-and-merge —
+
+    python-level: sqlite3 backup of forward.sqlite to snap.sqlite,
+    then on work.sqlite: ATTACH snap; INSERT OR IGNORE into
+    collector_runs, collector_gaps, raw_responses; DETACH.
+
+The raw layer is append-only with stable primary keys, so the merge
+is idempotent; all normalization/LLM/analysis then runs on
+work.sqlite with zero contention.

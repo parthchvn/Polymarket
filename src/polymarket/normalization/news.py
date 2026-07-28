@@ -225,6 +225,157 @@ def _event_family_key(entities: list[str], claim_text: str) -> str:
     return "|".join(sorted(set(_tokens(claim_text)))[:4]) or "misc"
 
 
+def _article_hash(conn: sqlite3.Connection, art_id: str) -> str:
+    row = conn.execute(
+        "SELECT content_hash FROM news_articles WHERE article_id = ?",
+        (art_id,),
+    ).fetchone()
+    return row["content_hash"] if row else ""
+
+
+def ingest_claims_for_article(
+    conn: sqlite3.Connection,
+    result: NormalizationResult,
+    *,
+    art_id: str,
+    headline: str,
+    body: str,
+    first_observed_at: float,
+    now: float,
+    markets: list,
+    extractor,
+    scorer,
+    surprise=None,
+    content_hash: str | None = None,
+) -> None:
+    """Claim extraction + event-family linkage + relevance scoring for
+    ONE article.  Shared by inline normalization and the LLM backfill:
+    claim ``first_available_at`` is the article's observation time
+    (text availability), while relevance rows carry their own
+    ``scored_at`` — a backfilled extraction never pretends to have
+    existed earlier than its text, and never hides when it was
+    scored."""
+    for claim in extractor.extract(headline, body):
+        claim_id = namespace_id("claim", art_id, claim["claim_text"])
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO news_claims
+                (claim_id, article_id, claim_text, entities_json,
+                 quantities_json, supporting_span, first_available_at,
+                 extractor_version, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                claim_id, art_id, claim["claim_text"],
+                canonical_json(claim.get("entities", [])),
+                canonical_json(claim.get("quantities", [])),
+                claim.get("supporting_span"), first_observed_at,
+                getattr(extractor, "version", EXTRACTOR_VERSION),
+                claim.get("confidence"),
+            ),
+        )
+        if not cur.rowcount:
+            result.add_ignored("news_claims")
+            continue
+        result.add_inserted("news_claims")
+
+        # ---- event family --------------------------------------------
+        family_key = _event_family_key(
+            claim.get("entities", []), claim["claim_text"]
+        )
+        family_id = namespace_id("event_family", family_key)
+        existing = conn.execute(
+            "SELECT earliest_available_at FROM event_families "
+            "WHERE event_family_id = ?",
+            (family_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO event_families
+                    (event_family_id, label, earliest_available_at,
+                     created_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (family_id, family_key, first_observed_at,
+                 "rule-based", now),
+            )
+            result.add_inserted("event_families")
+            edge_type = "new"
+        else:
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM news_articles a
+                JOIN news_claims c ON c.article_id = a.article_id
+                JOIN claim_edges e ON e.claim_id = c.claim_id
+                WHERE e.event_family_id = ? AND a.content_hash = ?
+                  AND c.claim_id != ?
+                LIMIT 1
+                """,
+                (family_id, content_hash or _article_hash(
+                    conn, art_id
+                ), claim_id),
+            ).fetchone()
+            edge_type = "duplicate" if duplicate else "confirmation"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO claim_edges
+                (edge_id, claim_id, event_family_id, edge_type,
+                 effective_from, evidence, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                namespace_id("edge", claim_id, family_id), claim_id,
+                family_id, edge_type, first_observed_at, family_key, 0.5,
+            ),
+        )
+        result.add_inserted("claim_edges")
+
+        # ---- relevance judgments -------------------------------------
+        for market in markets:
+            if market["version_seq"] is None:
+                continue
+            scored = scorer.score(
+                claim["claim_text"], market["question"], market["rules_text"]
+            )
+            if scored is None:
+                continue        # scoring budget deferred this claim
+            novelty = 1.0 if edge_type == "new" else 0.3
+            model_version = getattr(
+                scorer, "version", RELEVANCE_MODEL_VERSION
+            )
+            scorer_method = getattr(
+                scorer, "method", "rule_keyword_overlap"
+            )
+            judgment_id = namespace_id(
+                "relevance", claim_id, family_id,
+                market["market_id"], market["version_seq"],
+                scorer_method, model_version,
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO relevance_judgments
+                    (relevance_judgment_id, claim_id, event_family_id,
+                     market_id, contract_version_seq,
+                     source_effective_at, scored_at, computed_at,
+                     rel_class, rel_score, direction, novelty,
+                     surprise, method, model_version, evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    judgment_id, claim_id, family_id,
+                    market["market_id"], market["version_seq"],
+                    first_observed_at, now, first_observed_at,
+                    scored["rel_class"], scored["rel_score"],
+                    scored["direction"], novelty,
+                    surprise, scorer_method,
+                    model_version,
+                    canonical_json(scored.get("evidence", {})),
+                ),
+            )
+            result.add_inserted("relevance_judgments")
+
+
 def normalize_news(
     conn: sqlite3.Connection,
     raw_row: sqlite3.Row,
@@ -288,121 +439,84 @@ def normalize_news(
             continue
         result.add_inserted("news_articles")
 
-        for claim in extractor.extract(headline, body):
-            claim_id = namespace_id("claim", art_id, claim["claim_text"])
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO news_claims
-                    (claim_id, article_id, claim_text, entities_json,
-                     quantities_json, supporting_span, first_available_at,
-                     extractor_version, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    claim_id, art_id, claim["claim_text"],
-                    canonical_json(claim.get("entities", [])),
-                    canonical_json(claim.get("quantities", [])),
-                    claim.get("supporting_span"), first_observed_at,
-                    getattr(extractor, "version", EXTRACTOR_VERSION),
-                    claim.get("confidence"),
-                ),
-            )
-            if not cur.rowcount:
-                result.add_ignored("news_claims")
-                continue
-            result.add_inserted("news_claims")
-
-            # ---- event family --------------------------------------------
-            family_key = _event_family_key(
-                claim.get("entities", []), claim["claim_text"]
-            )
-            family_id = namespace_id("event_family", family_key)
-            existing = conn.execute(
-                "SELECT earliest_available_at FROM event_families "
-                "WHERE event_family_id = ?",
-                (family_id,),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    """
-                    INSERT INTO event_families
-                        (event_family_id, label, earliest_available_at,
-                         created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (family_id, family_key, first_observed_at,
-                     "rule-based", now),
-                )
-                result.add_inserted("event_families")
-                edge_type = "new"
-            else:
-                duplicate = conn.execute(
-                    """
-                    SELECT 1 FROM news_articles a
-                    JOIN news_claims c ON c.article_id = a.article_id
-                    JOIN claim_edges e ON e.claim_id = c.claim_id
-                    WHERE e.event_family_id = ? AND a.content_hash = ?
-                      AND c.claim_id != ?
-                    LIMIT 1
-                    """,
-                    (family_id, content_hash, claim_id),
-                ).fetchone()
-                edge_type = "duplicate" if duplicate else "confirmation"
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO claim_edges
-                    (edge_id, claim_id, event_family_id, edge_type,
-                     effective_from, evidence, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    namespace_id("edge", claim_id, family_id), claim_id,
-                    family_id, edge_type, first_observed_at, family_key, 0.5,
-                ),
-            )
-            result.add_inserted("claim_edges")
-
-            # ---- relevance judgments -------------------------------------
-            for market in markets:
-                if market["version_seq"] is None:
-                    continue
-                scored = scorer.score(
-                    claim["claim_text"], market["question"], market["rules_text"]
-                )
-                if scored is None:
-                    continue        # scoring budget deferred this claim
-                novelty = 1.0 if edge_type == "new" else 0.3
-                model_version = getattr(
-                    scorer, "version", RELEVANCE_MODEL_VERSION
-                )
-                scorer_method = getattr(
-                    scorer, "method", "rule_keyword_overlap"
-                )
-                judgment_id = namespace_id(
-                    "relevance", claim_id, family_id,
-                    market["market_id"], market["version_seq"],
-                    scorer_method, model_version,
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO relevance_judgments
-                        (relevance_judgment_id, claim_id, event_family_id,
-                         market_id, contract_version_seq,
-                         source_effective_at, scored_at, computed_at,
-                         rel_class, rel_score, direction, novelty,
-                         surprise, method, model_version, evidence_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        judgment_id, claim_id, family_id,
-                        market["market_id"], market["version_seq"],
-                        first_observed_at, now, first_observed_at,
-                        scored["rel_class"], scored["rel_score"],
-                        scored["direction"], novelty,
-                        record.get("surprise"), scorer_method,
-                        model_version,
-                        canonical_json(scored.get("evidence", {})),
-                    ),
-                )
-                result.add_inserted("relevance_judgments")
+        ingest_claims_for_article(
+            conn, result,
+            art_id=art_id, headline=headline, body=body,
+            first_observed_at=first_observed_at, now=now,
+            markets=markets, extractor=extractor, scorer=scorer,
+            surprise=record.get("surprise"),
+            content_hash=content_hash,
+        )
     conn.commit()
+
+
+def market_contract_rows(conn: sqlite3.Connection) -> list:
+    return conn.execute(
+        """
+        SELECT m.market_id, m.question,
+               cv.version_seq, cv.rules_text
+        FROM markets m
+        LEFT JOIN contract_versions cv ON cv.market_id = m.market_id
+            AND cv.version_seq = (
+                SELECT MAX(version_seq) FROM contract_versions
+                WHERE market_id = m.market_id
+            )
+        """
+    ).fetchall()
+
+
+def backfill_llm_claims(
+    conn: sqlite3.Connection,
+    extractor,
+    scorer,
+    *,
+    limit: int | None = None,
+) -> dict:
+    """Run an (LLM) claim extractor over EXISTING articles that have no
+    claims from this extractor version — normalization only extracts
+    on first article insert, so body-level LLM extraction needs this
+    backfill for articles first normalized by the rule extractor.
+    Resumable: already-covered articles are skipped; ``limit`` bounds
+    NEW extractions per run."""
+    import time as _time
+
+    version = getattr(extractor, "version", None)
+    rows = conn.execute(
+        """
+        SELECT a.article_id, a.headline, a.body, a.first_observed_at
+        FROM news_articles a
+        WHERE NOT EXISTS (
+            SELECT 1 FROM news_claims c
+            WHERE c.article_id = a.article_id
+              AND c.extractor_version = ?
+        )
+        ORDER BY a.first_observed_at
+        """,
+        (version,),
+    ).fetchall()
+    result = NormalizationResult(
+        raw_response_id=-1, collector="backfill", endpoint="backfill"
+    )
+    markets = market_contract_rows(conn)
+    now = _time.time()
+    processed = 0
+    for row in rows:
+        if limit is not None and processed >= limit:
+            break
+        ingest_claims_for_article(
+            conn, result,
+            art_id=row["article_id"],
+            headline=row["headline"] or "",
+            body=row["body"] or "",
+            first_observed_at=float(row["first_observed_at"]),
+            now=now, markets=markets,
+            extractor=extractor, scorer=scorer,
+        )
+        processed += 1
+    conn.commit()
+    return {
+        "articles_pending": len(rows),
+        "articles_processed": processed,
+        "inserted": dict(result.inserted),
+        "extractor_version": version,
+    }

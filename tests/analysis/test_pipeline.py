@@ -106,3 +106,51 @@ def test_gate_2_uses_gold_labels_when_present(synth_db, tmp_path):
     # stays PENDING with the honest overlap explanation
     assert gate["status"] == "pending"
     assert "gold labels" in gate["reason"]
+
+
+def test_online_screens_use_previous_cycle_model(tmp_path):
+    """Refit-then-screen-with-the-newest makes every online screen
+    refuse as model_unavailable forever; the pipeline must screen this
+    window's news with the PREVIOUS cycle's model (fitted before the
+    news existed) and reserve the fresh fit for the next window."""
+    import sys
+
+    sys.path.insert(0, "tests/analysis")
+    import test_liquidity_modes as modes_t
+
+    from polymarket.analysis.liquidity_modes import (
+        JumpModelConfig,
+        fit_jump_model,
+        persist_jump_model,
+    )
+    from polymarket.contracts.schema import init_db
+
+    db = str(tmp_path / "preq.sqlite")
+    conn = init_db(db, description="prequential")
+    modes_t._regime_world(conn, event_windows=((30, 40), (100, 112)))
+    # cycle 1 fitted a model BEFORE the news
+    cutoff_1 = modes_t.T0 + 60 * modes_t.BIN
+    model_1 = fit_jump_model(
+        conn, fit_cutoff=cutoff_1,
+        config=JumpModelConfig(fixed_lambda=1.0),
+    )
+    persist_jump_model(conn, model_1, cutoff_1)
+    # news arrives AFTER cycle 1's cutoff, inside an event window
+    modes_t._news_family(
+        conn, "fam-preq", modes_t.T0 + 100 * modes_t.BIN + 42
+    )
+    conn.commit()
+    conn.close()
+    report = run_reasoning_pipeline(
+        db, str(tmp_path / "out"),
+        skip={"normalize", "analysis", "underreaction"},
+    )
+    screens = report["stages"]["impact_screens"]
+    assert screens["status"] == "ok"
+    # online screening used the PREVIOUS run, not the fresh fit
+    assert screens["online_screened_by"] == model_1.mode_run_id
+    assert screens["online_filtered"]["screened"] == 1
+    assert screens["online_filtered"]["model_unavailable"] == 0
+    # the fresh fit handled the retrospective basis
+    assert screens["retrospective_screened_by"] != model_1.mode_run_id
+    assert screens["retrospective_smoothed"]["screened"] == 1
