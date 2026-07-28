@@ -490,12 +490,18 @@ def test_backfill_llm_claims_resumable(tmp_path):
                     "direction": 0.1, "evidence": {}}
 
     extractor = BodyExtractor()
-    first = backfill_llm_claims(conn, extractor, Scorer(), limit=2)
+    first = backfill_llm_claims(
+        conn, extractor, Scorer(), limit=2,
+        min_body_chars=0, relevance_filter=False, order="oldest",
+    )
     assert first["articles_processed"] == 2
     assert extractor.calls == 2
     # resume: the two covered articles are skipped, third processed
     extractor2 = BodyExtractor()
-    second = backfill_llm_claims(conn, extractor2, Scorer(), limit=5)
+    second = backfill_llm_claims(
+        conn, extractor2, Scorer(), limit=5,
+        min_body_chars=0, relevance_filter=False,
+    )
     assert second["articles_processed"] == 1
     assert extractor2.calls == 1
     rows = conn.execute(
@@ -552,7 +558,10 @@ def test_backfill_commits_per_article(tmp_path):
             return {"rel_class": "background", "rel_score": 0.3,
                     "direction": 0.0, "evidence": {}}
 
-    report = backfill_llm_claims(conn, Crashing(), Scorer())
+    report = backfill_llm_claims(
+        conn, Crashing(), Scorer(),
+        min_body_chars=0, relevance_filter=False,
+    )
     # the poison article is recorded and SKIPPED, the queue advances
     assert report["articles_failed"] == 1
     assert report["articles_processed"] == 2
@@ -584,3 +593,91 @@ def test_cap_extracted_claims_bounds_degenerate_output():
     # highest-confidence unique claims kept
     assert capped[0].claim_text == "claim 29"
     assert len({c.claim_text for c in capped}) == len(capped)
+
+
+def test_backfill_queue_is_prioritized(tmp_path):
+    """Newest-first, real bodies only, and rule-relevance-filtered:
+    Qwen-minutes go to articles that can matter, not stale RSS."""
+    from polymarket.contracts.schema import init_db
+    from polymarket.normalization.news import backfill_llm_claims
+
+    conn = init_db(str(tmp_path / "prio.sqlite"), description="p")
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO markets (market_id, condition_id, "
+        "question, raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-p', '0xp', 'Q?', 1, 0, 'h', 'p', 2, ?)", (now,),
+    )
+    # article A: old, relevant, real body
+    # article B: new, relevant, real body      -> processed FIRST
+    # article C: new, relevant, headline-only  -> excluded (no body)
+    # article D: new, irrelevant, real body    -> excluded (filter)
+    specs = {
+        "A": (100.0, "x" * 500, 0.5, "indirect"),
+        "B": (200.0, "x" * 500, 0.5, "indirect"),
+        "C": (300.0, "", 0.5, "indirect"),
+        "D": (400.0, "x" * 500, 0.0, "irrelevant"),
+    }
+    for key, (ts, body, score, rel_class) in specs.items():
+        conn.execute(
+            "INSERT INTO news_articles (article_id, source_id, "
+            "source_url, source_published_at, first_observed_at, "
+            "download_completed_at, timestamp_source, "
+            "timestamp_confidence, headline, body, content_hash, "
+            "raw_response_id, raw_record_index, raw_record_hash, "
+            "parser_version, schema_version, normalized_at) VALUES "
+            "(?, 's', 'u', ?, ?, ?, 'feed', 0.8, ?, ?, ?, 1, 0, 'h', "
+            "'p', 1, ?)",
+            (f"art-{key}", ts, ts, ts, f"headline {key}", body,
+             f"ch-{key}", now),
+        )
+        conn.execute(
+            "INSERT INTO news_claims (claim_id, article_id, "
+            "claim_text, entities_json, quantities_json, "
+            "first_available_at, extractor_version, confidence) "
+            "VALUES (?, ?, ?, '[]', '[]', ?, 'rule-1.0.0', 0.9)",
+            (f"cl-{key}", f"art-{key}", f"rule claim {key}", ts),
+        )
+        conn.execute(
+            "INSERT INTO relevance_judgments (relevance_judgment_id, "
+            "claim_id, event_family_id, market_id, "
+            "contract_version_seq, source_effective_at, scored_at, "
+            "computed_at, rel_class, rel_score, direction, novelty, "
+            "method, model_version, evidence_json) VALUES "
+            "(?, ?, 'fam-p', 'm-p', 1, ?, ?, ?, ?, ?, 0.0, 1.0, "
+            "'rule_keyword_overlap', 'rule-1.0.0', '{}')",
+            (f"rj-{key}", f"cl-{key}", ts, ts, ts, rel_class, score),
+        )
+    conn.commit()
+
+    class Recorder:
+        version = "prio-v1"
+
+        def __init__(self):
+            self.seen = []
+
+        def extract(self, headline, body):
+            self.seen.append(headline)
+            return [{"claim_text": f"llm {headline}", "entities": [],
+                     "quantities": [], "confidence": 0.9}]
+
+    class Scorer:
+        method, version = "ollama_llm", "s1"
+
+        def score(self, *a):
+            return {"rel_class": "background", "rel_score": 0.3,
+                    "direction": 0.0, "evidence": {}}
+
+    rec = Recorder()
+    report = backfill_llm_claims(conn, rec, Scorer())
+    assert report["articles_pending"] == 2           # A and B only
+    assert rec.seen == ["headline B", "headline A"]  # newest first
+    assert report["queue_policy"]["order"] == "newest"
+    # relaxing the filters exposes the rest
+    rec2 = Recorder()
+    relaxed = backfill_llm_claims(
+        conn, rec2, Scorer(),
+        min_body_chars=0, relevance_filter=False,
+    )
+    assert relaxed["articles_pending"] == 2          # C and D remain
