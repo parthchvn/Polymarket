@@ -396,6 +396,27 @@ DDL: list[str] = [
     );
     """,
     """
+    CREATE TABLE IF NOT EXISTS annotation_batches (
+        batch_id TEXT PRIMARY KEY,
+        created_at REAL NOT NULL,
+        sampler_config_json TEXT NOT NULL,
+        n_decisions INTEGER NOT NULL,
+        feature_version TEXT NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS annotations (
+        batch_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        reviewer TEXT NOT NULL,
+        label TEXT NOT NULL,
+        confidence REAL,
+        notes TEXT,
+        imported_at REAL NOT NULL,
+        PRIMARY KEY (batch_id, decision_id, reviewer)
+    );
+    """,
+    """
     CREATE TABLE IF NOT EXISTS liquidity_mode_runs (
         mode_run_id TEXT PRIMARY KEY,
         fit_cutoff REAL NOT NULL,
@@ -536,6 +557,8 @@ REQUIRED_TABLES = [
     "liquidity_mode_runs",
     "liquidity_mode_assignments",
     "news_impact_screens",
+    "annotation_batches",
+    "annotations",
 ]
 
 LINEAGE_COLUMNS = ("raw_response_id", "parser_version", "schema_version", "normalized_at")

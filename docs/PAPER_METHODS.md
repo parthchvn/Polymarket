@@ -238,3 +238,33 @@ outcome layer.  ``predicted_remaining_adjustment`` (a drift forecast
 from a model trained before the decision) is deliberately deferred: it
 requires a versioned, trained-before-decision forecast artifact and
 will arrive with the real-data reasoning work.
+
+
+## Real reasoning dataset (PR D)
+
+**Track A — human-labelled evaluation set.**
+``export-annotation-batch`` samples real decisions (deterministic,
+stratified over condition x UTC day x dominant attribution channel)
+and renders each as a STRICT pre-decision record — reviewers see
+exactly what the model sees, through the same context path, with
+nothing post-decision renderable (tested).  The label set includes
+``INSUFFICIENT_EVIDENCE`` as a first-class answer.
+``import-annotations`` ingests independent reviewer files, computes
+raw agreement, Cohen's kappa and per-label agreement, and persists
+every judgment; gold labels are unanimous-consensus only.
+
+**Track B — latent reasoning scaffold.**
+``train-latent-reasoning`` fits a rank-K bottleneck decision model
+(encoder z = W'x over context features, logistic decoder), evaluated
+ONLY on held-out actors and a held-out final time slice against the
+full-rank C-only baseline and the base-rate null (gate 1: predictive
+value); cluster stability across seeds is measured via multi-restart
+k-means with greedy centroid matching.  Latent dimensions are UNNAMED
+by construction — candidate primitives may be attached only after
+stability holds (open-set rule).  Thin samples are refused with the
+count that would be needed.  The synthetic-trained template classifier
+remains the diagnostic benchmark
+(``template_agreement_diagnostic``); nothing here retires it.  The
+full variational q(R|D,C)/p(D|C,R) model is the successor once gold
+labels and multi-week data exist; this scaffold defines the
+interfaces and the evaluation it must beat.

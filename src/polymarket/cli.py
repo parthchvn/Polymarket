@@ -268,6 +268,89 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_annotation_batch(args) -> int:
+    import json as _json
+    import os as _os
+
+    from polymarket.analysis.annotation import sample_annotation_batch
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    try:
+        batch = sample_annotation_batch(
+            conn, n=args.n, seed=args.seed, mode_run_id=args.mode_run_id,
+        )
+    except ValueError as exc:
+        print(f"cannot sample: {exc}")
+        return 1
+    _os.makedirs(args.output, exist_ok=True)
+    for reviewer in args.reviewer:
+        path = _os.path.join(
+            args.output, f"batch_{batch['batch_id'][:12]}_{reviewer}.jsonl"
+        )
+        with open(path, "w") as handle:
+            for item in batch["items"]:
+                handle.write(_json.dumps(item, sort_keys=True) + "\n")
+        print(f"wrote {len(batch['items'])} decisions for "
+              f"{reviewer}: {path}")
+    print(f"batch_id: {batch['batch_id']}")
+    print("reviewers label independently; then: import-annotations")
+    conn.close()
+    return 0
+
+
+def cmd_import_annotations(args) -> int:
+    import json as _json
+
+    from polymarket.analysis.annotation import import_annotations
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    files = {}
+    for spec in args.reviewer_file:
+        reviewer, _, path = spec.partition("=")
+        if not path:
+            print(f"--reviewer-file expects NAME=PATH, got {spec!r}")
+            return 1
+        files[reviewer] = path
+    report = import_annotations(conn, args.batch_id, files)
+    print(_json.dumps(report, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
+def cmd_train_latent_reasoning(args) -> int:
+    import json as _json
+    import os as _os
+    import time as _time
+
+    from polymarket.analysis.latent_reasoning import (
+        assemble_decision_matrix,
+        evaluate_latent_reasoning,
+    )
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    data = assemble_decision_matrix(
+        conn, end_time=args.end_time or _time.time(),
+        mode_run_id=args.mode_run_id,
+    )
+    report = evaluate_latent_reasoning(
+        data, latent_dim=args.latent_dim, seed=args.seed,
+    )
+    _os.makedirs(args.output, exist_ok=True)
+    path = _os.path.join(args.output, "latent_reasoning_report.json")
+    with open(path, "w") as handle:
+        _json.dump(report, handle, indent=2, sort_keys=True)
+    print(_json.dumps(report, indent=2, sort_keys=True))
+    print(f"wrote {path}")
+    conn.close()
+    return 0
+
+
 def cmd_underreaction(args) -> int:
     import json as _json
     import os as _os
@@ -642,6 +725,43 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "export-annotation-batch",
+        help="sample real decisions as strict pre-decision records for "
+             "human labelling (Track A)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--n", type=int, default=300)
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--mode-run-id", default=None)
+    p.add_argument("--reviewer", action="append", required=True,
+                   help="repeatable; one file per reviewer")
+    p.set_defaults(func=cmd_export_annotation_batch)
+
+    p = sub.add_parser(
+        "import-annotations",
+        help="import completed reviewer files; agreement + kappa",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--batch-id", required=True)
+    p.add_argument("--reviewer-file", action="append", required=True,
+                   help="repeatable; NAME=PATH")
+    p.set_defaults(func=cmd_import_annotations)
+
+    p = sub.add_parser(
+        "train-latent-reasoning",
+        help="rank-K latent decision model with held-out actor/time "
+             "evaluation (Track B scaffold)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--latent-dim", type=int, default=8)
+    p.add_argument("--seed", type=int, default=13)
+    p.add_argument("--end-time", type=float, default=None)
+    p.add_argument("--mode-run-id", default=None)
+    p.set_defaults(func=cmd_train_latent_reasoning)
 
     p = sub.add_parser(
         "underreaction-analysis",
