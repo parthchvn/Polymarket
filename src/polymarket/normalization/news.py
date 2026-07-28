@@ -524,7 +524,8 @@ def backfill_llm_claims(
     direction = "DESC" if order == "newest" else "ASC"
     rows = conn.execute(
         f"""
-        SELECT a.article_id, a.headline, a.body, a.first_observed_at
+        SELECT a.article_id, a.headline, a.body, a.first_observed_at,
+               a.download_completed_at
         FROM news_articles a
         WHERE {" AND ".join(conditions)}
         ORDER BY a.first_observed_at {direction}
@@ -547,7 +548,13 @@ def backfill_llm_claims(
                 art_id=row["article_id"],
                 headline=row["headline"] or "",
                 body=row["body"] or "",
-                first_observed_at=float(row["first_observed_at"]),
+                # availability honesty: a claim from a
+                # late-downloaded body was readable only once the text
+                # was in hand
+                first_observed_at=max(
+                    float(row["first_observed_at"]),
+                    float(row["download_completed_at"] or 0.0),
+                ),
                 now=now, markets=markets,
                 extractor=extractor, scorer=scorer,
             )
