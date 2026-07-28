@@ -437,3 +437,73 @@ def test_limited_relevance_scorer_budget(conn):
     out = [limited.score("c", "q", "r") for _ in range(5)]
     assert inner.calls == 2
     assert out[2] is None and limited.deferred == 3
+
+
+def test_backfill_llm_claims_resumable(tmp_path):
+    """Articles first normalized by the rule extractor get body-level
+    claims from the backfill — versioned, budgeted, resumable, and
+    with honest availability (claim availability = article
+    observation time, judgment scored_at = now)."""
+    from polymarket.contracts.schema import init_db
+    from polymarket.normalization.news import backfill_llm_claims
+
+    conn = init_db(str(tmp_path / "backfill.sqlite"),
+                   description="backfill test")
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO markets (market_id, condition_id, "
+        "question, raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-b', '0xb', 'Will X invade?', 1, 0, 'h', 'p', 2, ?)",
+        (now,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO contract_versions (market_id, "
+        "version_seq, effective_from, first_observed_at, question, "
+        "rules_text, content_hash, raw_response_id, parser_version, "
+        "schema_version, normalized_at) VALUES ('m-b', 1, 0, 0, "
+        "'Will X invade?', 'rules about invasion', 'chb', 1, 'p', 2, ?)",
+        (now,),
+    )
+    for i in range(3):
+        _insert_article_claim(conn, f"bf-{i}", f"headline body {i}",
+                              1000.0 + i)
+    conn.commit()
+
+    class BodyExtractor:
+        version = "ollama-test-claims-v9"
+
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, headline, body):
+            self.calls += 1
+            return [{"claim_text": f"llm claim from {headline}",
+                     "entities": ["X"], "quantities": [],
+                     "confidence": 0.9}]
+
+    class Scorer:
+        method, version = "ollama_llm", "canned-v2"
+
+        def score(self, claim_text, question, rules):
+            return {"rel_class": "indirect", "rel_score": 0.6,
+                    "direction": 0.1, "evidence": {}}
+
+    extractor = BodyExtractor()
+    first = backfill_llm_claims(conn, extractor, Scorer(), limit=2)
+    assert first["articles_processed"] == 2
+    assert extractor.calls == 2
+    # resume: the two covered articles are skipped, third processed
+    extractor2 = BodyExtractor()
+    second = backfill_llm_claims(conn, extractor2, Scorer(), limit=5)
+    assert second["articles_processed"] == 1
+    assert extractor2.calls == 1
+    rows = conn.execute(
+        "SELECT c.first_available_at, r.scored_at FROM news_claims c "
+        "JOIN relevance_judgments r ON r.claim_id = c.claim_id "
+        "WHERE c.extractor_version = 'ollama-test-claims-v9'"
+    ).fetchall()
+    assert len(rows) == 3
+    for row in rows:
+        # availability honesty: text availability vs actual scoring time
+        assert row[0] < 2000.0 and row[1] > 2000.0
