@@ -268,3 +268,22 @@ remains the diagnostic benchmark
 full variational q(R|D,C)/p(D|C,R) model is the successor once gold
 labels and multi-week data exist; this scaffold defines the
 interfaces and the evaluation it must beat.
+
+
+## One-command pipeline (PR E)
+
+``reasoning-pipeline --db PATH --output DIR [--reasoning-model ART]``
+runs the whole chain — migrate, normalize, 300s+900s bars
+(incremental), jump-model fit, both screen bases, replay/DRC with the
+O layer, underreaction regressions, and the latent evaluation — with
+per-stage isolation: a refusal (thin bars, thin actors, missing
+artifact) records its reason and skips only what depends on it.  The
+single ``acceptance_report.json`` states each research gate honestly:
+
+1. predictive value (latent beats C-only on held-out actors AND the
+   final time slice), 2. human agreement (model primaries vs unanimous
+   gold labels; pending until a batch is imported), 3. cluster
+   stability across seeds, 4. honest abstention (DRC status
+   distribution; abstention should fall as coverage grows across
+   runs).  A data-readiness section (complete bars, decisions, actors)
+   turns every refusal into a concrete collection target.
