@@ -507,3 +507,57 @@ def test_backfill_llm_claims_resumable(tmp_path):
     for row in rows:
         # availability honesty: text availability vs actual scoring time
         assert row[0] < 2000.0 and row[1] > 2000.0
+
+
+def test_backfill_commits_per_article(tmp_path):
+    """LLM extraction takes minutes per article: progress must be
+    durable article-by-article, so interruption loses at most the
+    article in flight."""
+    import sqlite3 as _sq
+
+    from polymarket.contracts.schema import init_db
+    from polymarket.normalization.news import backfill_llm_claims
+
+    db = str(tmp_path / "commit.sqlite")
+    conn = init_db(db, description="commit test")
+    now = time.time()
+    conn.execute(
+        "INSERT OR IGNORE INTO markets (market_id, condition_id, "
+        "question, raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('m-c', '0xc', 'Q?', 1, 0, 'h', 'p', 2, ?)", (now,),
+    )
+    for i in range(3):
+        _insert_article_claim(conn, f"cm-{i}", f"text {i}", 500.0 + i)
+    conn.commit()
+
+    class Crashing:
+        version = "crash-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, headline, body):
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("ollama died mid-batch")
+            return [{"claim_text": f"c from {headline}",
+                     "entities": [], "quantities": [],
+                     "confidence": 0.9}]
+
+    class Scorer:
+        method, version = "ollama_llm", "s1"
+
+        def score(self, *a):
+            return {"rel_class": "background", "rel_score": 0.3,
+                    "direction": 0.0, "evidence": {}}
+
+    with pytest.raises(RuntimeError):
+        backfill_llm_claims(conn, Crashing(), Scorer())
+    # the two completed articles survived via a SEPARATE connection
+    other = _sq.connect(db)
+    count = other.execute(
+        "SELECT COUNT(*) FROM news_claims "
+        "WHERE extractor_version = 'crash-v1'"
+    ).fetchone()[0]
+    assert count == 2

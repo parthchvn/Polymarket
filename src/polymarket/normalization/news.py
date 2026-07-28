@@ -513,6 +513,10 @@ def backfill_llm_claims(
             extractor=extractor, scorer=scorer,
         )
         processed += 1
+        # commit PER ARTICLE: LLM extraction can take minutes per
+        # article, so progress must be durable and interruption must
+        # be free (Ctrl-C loses at most the article in flight)
+        conn.commit()
     conn.commit()
     return {
         "articles_pending": len(rows),
