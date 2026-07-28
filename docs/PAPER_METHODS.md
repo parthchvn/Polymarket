@@ -202,3 +202,39 @@ work before transfer results are used in claims.
   labelled backtests/replications with frozen scorers; `run-analysis`
   replays use this and record it in the run config and context
   coverage.
+
+
+## Paper -> DRC integration (PR C)
+
+Decision contexts carry a ``paper_state`` channel, populated when a
+fitted mode run is supplied (``run-analysis --mode-run-id``), with
+STRICT as-of semantics throughout: the liquidity mode is the ONLINE
+label of the latest bin fully closed before the decision; impact
+screens appear only when ``screen_available_at`` precedes the decision
+(online basis, deployment-gated per row; the as-of accessor now also
+requires an actual detected transition); the initial market response
+so far runs from the last pre-news close to the last close BEFORE the
+decision — both past observations, so it belongs to C; attention loads
+use the ONLINE relevance policy.  Features: the ``paper`` group
+(mode/age/prevalence, screen availability/count/probability, the
+contradiction flag, initial response, attention loads) with explicit
+missing flags; attribution gains ``liquidity_state``,
+``impactful_news`` and ``attention`` channels, and the feature-version
+hash changes so stale reasoning artifacts are refused (retrain
+required, by design).
+
+Gate tightening: PERSISTENT_NEWS_ADJUSTMENT is now incompatible with
+``impact_screen_contradiction`` — screens ran for the market and found
+NO impactful news, i.e. the market's own liquidity reaction
+contradicts a persistent-adjustment story.
+
+Ex-post outcomes live EXCLUSIVELY in the O layer
+(``analysis/outcomes.py``): realised post-decision drift per horizon
+with censoring and fresh-endpoint discipline, attached to DRC records
+as a final export pass after features, attributions, posteriors and
+counterfactuals are frozen; a structural test asserts no outcome key
+is a feature and no context/feature/reasoning module imports the
+outcome layer.  ``predicted_remaining_adjustment`` (a drift forecast
+from a model trained before the decision) is deliberately deferred: it
+requires a versioned, trained-before-decision forecast artifact and
+will arrive with the real-data reasoning work.

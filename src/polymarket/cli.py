@@ -212,6 +212,7 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
         embargo_seconds=args.embargo,
         seed=args.seed,
         run_id=args.run_id,
+        mode_run_id=args.mode_run_id,
         reasoning_model=reasoning_model,
         reasoning_target=args.reasoning_target,
     )
@@ -244,7 +245,9 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
             write_reasoning_outputs,
         )
 
-        paths.update(write_reasoning_outputs(run, args.output))
+        paths.update(write_reasoning_outputs(
+            run, args.output, outcomes_conn=reader.conn,
+        ))
     audit_path = os.path.join(args.output, "audit_summary.json")
     with open(audit_path, "w") as fh:
         json.dump(audit_database(reader.conn), fh, indent=2)
@@ -778,6 +781,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="stable run identifier; reruns with the same id replace "
              "their own judgments (idempotent)",
     )
+    p.add_argument("--mode-run-id", default=None,
+                   help="fitted liquidity mode run: populates the "
+                        "paper-derived strict-as-of context features")
     p.set_defaults(func=cmd_run_analysis)
     return parser
 

@@ -99,6 +99,18 @@ ATTRIBUTION_GROUPS: dict[str, list[str]] = {
         "news_decay_signed_168h", "news_decay_positive_168h",
         "news_decay_negative_168h",
     ],
+    "liquidity_state": [
+        "liq_mode_event", "liq_mode_missing", "liq_mode_age_hours",
+        "event_mode_prevalence", "event_mode_prevalence_missing",
+    ],
+    "impactful_news": [
+        "impact_screen_available", "impactful_news_count",
+        "impactful_news_probability", "impact_screen_contradiction",
+        "initial_response_so_far", "initial_response_missing",
+    ],
+    "attention": [
+        "attention_claim_load", "attention_unrelated_load",
+    ],
 }
 
 ATTRIBUTION_FEATURES = [n for g in ATTRIBUTION_GROUPS.values() for n in g]

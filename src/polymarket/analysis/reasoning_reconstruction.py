@@ -254,6 +254,7 @@ def _occurrence_reconstruction(
         context = build_context(
             reader, opportunity.episode,
             relevance_availability="retrospective_source",
+            mode_run_id=run.config.get("mode_run_id"),
         )
         features.append(compute_features(context, opportunity.episode))
         evidence_by_id[opportunity.episode.decision_id] = news_evidence(
@@ -317,8 +318,27 @@ def _occurrence_reconstruction(
 
 
 # ---------------------------------------------------------------------------
-def write_reasoning_outputs(run: "ReplayRun", output_dir: str) -> dict[str, str]:
-    """drc_records.jsonl, occurrence_drc_records.jsonl and a summary."""
+def write_reasoning_outputs(
+    run: "ReplayRun", output_dir: str,
+    *, outcomes_conn=None, outcome_bin_seconds: float = 900.0,
+) -> dict[str, str]:
+    """drc_records.jsonl, occurrence_drc_records.jsonl and a summary.
+
+    When ``outcomes_conn`` is supplied, the ex-post outcome layer O is
+    attached as a FINAL pass — features, attributions, posteriors and
+    counterfactuals are already frozen inside the records, so realised
+    post-decision drift can never flow back into P(R|D,C)."""
+    if outcomes_conn is not None:
+        from polymarket.analysis.outcomes import attach_outcomes
+
+        attach_outcomes(
+            run.drc_records, outcomes_conn,
+            bin_seconds=outcome_bin_seconds,
+        )
+        attach_outcomes(
+            run.occurrence_drc_records, outcomes_conn,
+            bin_seconds=outcome_bin_seconds,
+        )
     os.makedirs(output_dir, exist_ok=True)
     paths: dict[str, str] = {}
 

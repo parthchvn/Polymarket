@@ -10,6 +10,7 @@ substantive zero.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from polymarket.analysis.context import DecisionContext
@@ -52,6 +53,14 @@ FEATURE_GROUPS = {
         "news_decay_negative_72h",
         "news_decay_signed_168h", "news_decay_positive_168h",
         "news_decay_negative_168h",
+    ],
+    "paper": [
+        "liq_mode_event", "liq_mode_missing", "liq_mode_age_hours",
+        "event_mode_prevalence", "event_mode_prevalence_missing",
+        "impact_screen_available", "impactful_news_count",
+        "impactful_news_probability", "impact_screen_contradiction",
+        "initial_response_so_far", "initial_response_missing",
+        "attention_claim_load", "attention_unrelated_load",
     ],
 }
 
@@ -377,6 +386,47 @@ def compute_features(
         if a["source_published_at"] is not None
     ]
     f["news_ingestion_lag"] = sum(lags) / len(lags) if lags else 0.0
+    # ---- paper-derived state (strict as-of; PR C integration) --------
+    paper = getattr(context, "paper_state", {}) or {}
+    mode = paper.get("liquidity_mode")
+    f["liq_mode_event"] = (
+        1.0 if mode and mode["mode_label_online"] == "event" else 0.0
+    )
+    f["liq_mode_missing"] = 0.0 if mode else 1.0
+    f["liq_mode_age_hours"] = (
+        mode["age_seconds"] / 3600.0 if mode else 0.0
+    )
+    prevalence = paper.get("event_mode_prevalence")
+    f["event_mode_prevalence"] = (
+        prevalence if prevalence is not None else 0.0
+    )
+    f["event_mode_prevalence_missing"] = (
+        0.0 if prevalence is not None else 1.0
+    )
+    screens = paper.get("impact_screens", [])
+    evaluated = paper.get("screens_evaluated", 0)
+    f["impact_screen_available"] = 1.0 if evaluated > 0 else 0.0
+    f["impactful_news_count"] = float(len(screens))
+    f["impactful_news_probability"] = (
+        max((s_["impact_score"] for s_ in screens), default=0.0)
+    )
+    # screens ran for this market and found NO impactful news: the
+    # persistent-adjustment story is contradicted by the market's own
+    # liquidity reaction
+    f["impact_screen_contradiction"] = (
+        1.0 if evaluated > 0 and not screens else 0.0
+    )
+    initial = paper.get("initial_response_so_far")
+    f["initial_response_so_far"] = initial if initial is not None else 0.0
+    f["initial_response_missing"] = 0.0 if initial is not None else 1.0
+    attention = paper.get("attention", {})
+    f["attention_claim_load"] = math.log1p(
+        attention.get("claim_count_24h", 0)
+    )
+    f["attention_unrelated_load"] = math.log1p(
+        attention.get("unrelated_family_count_24h", 0)
+    )
+
     return {name: float(value) for name, value in f.items()}
 
 

@@ -202,6 +202,7 @@ def impactful_news_asof(
         WHERE mode_run_id = ? AND condition_id = ?
           AND assignment_basis = ?
           AND screen_status = 'screened'
+          AND transition_detected = 1
           AND screen_available_at < ?
         ORDER BY news_time
         """,

@@ -70,6 +70,7 @@ def run_replay(
     seed: int = 1337,
     run_id: str | None = None,
     relevance_availability: str = "retrospective_source",
+    mode_run_id: str | None = None,
     news_lookback: float = 86400.0,
     news_decay_half_lives: dict[str, float] | None = None,
     news_decay_max_age: float = NEWS_DECAY_MAX_AGE,
@@ -84,6 +85,7 @@ def run_replay(
             "end_time": end_time,
             "interval_seconds": interval_seconds,
         "relevance_availability": relevance_availability,
+        "mode_run_id": mode_run_id,
             "mixed_threshold": mixed_threshold,
             "n_folds": n_folds,
             "embargo_seconds": embargo_seconds,
@@ -115,6 +117,7 @@ def run_replay(
         context = build_context(
             reader, episode,
             relevance_availability=relevance_availability,
+            mode_run_id=mode_run_id,
         )
         features = compute_features(
             context,
