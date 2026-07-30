@@ -18,3 +18,6 @@ outputs/
 # the synthetic fixture IS committed; ignore its sqlite side files
 fixtures/*.sqlite-wal
 fixtures/*.sqlite-shm
+
+# local run data and large datasets
+runs/
