@@ -268,6 +268,47 @@ def cmd_run_analysis(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_sii(args) -> int:
+    import json as _json
+
+    from polymarket.contracts.schema import connect, ensure_paper_schema
+
+    try:
+        import duckdb  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            "error: pip install duckdb for the SII import"
+        ) from exc
+    from polymarket.collection.sii_import import (
+        import_market_metadata,
+        import_trades,
+        select_market_slice,
+    )
+
+    conn = connect(args.db)
+    ensure_paper_schema(conn)
+    markets = select_market_slice(
+        args.markets_parquet, top_n=args.top_n,
+        min_volume=args.min_volume, max_volume=args.max_volume,
+        since=args.since, until=args.until,
+    )
+    if not markets:
+        print("no markets match the slice filters")
+        return 1
+    print(f"slice: {len(markets)} markets, volumes "
+          f"{markets[-1]['volume']:.0f}..{markets[0]['volume']:.0f}")
+    for market in markets[:10]:
+        print(f"  {market['question'][:70]}")
+    import_market_metadata(conn, markets)
+    report = import_trades(
+        conn, markets, quant_source=args.quant_source,
+    )
+    report.pop("rows_per_market", None)
+    print(_json.dumps(report, indent=2, sort_keys=True))
+    conn.close()
+    return 0
+
+
 def cmd_fetch_article_bodies(args) -> int:
     import json as _json
 
@@ -816,6 +857,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser(
+        "import-sii",
+        help="import a slice of the SII historical dataset (resolved "
+             "markets + blockchain trades; quant.parquet read "
+             "remotely by default)",
+    )
+    p.add_argument("--db", required=True)
+    p.add_argument("--markets-parquet", required=True,
+                   help="local path to markets.parquet")
+    p.add_argument("--quant-source", default=None,
+                   help="local quant.parquet path; default: remote "
+                        "HuggingFace via range requests")
+    p.add_argument("--top-n", type=int, default=50)
+    p.add_argument("--min-volume", type=float, default=1e6)
+    p.add_argument("--max-volume", type=float, default=2e8)
+    p.add_argument("--since", default="2024-01-01")
+    p.add_argument("--until", default=None)
+    p.set_defaults(func=cmd_import_sii)
 
     p = sub.add_parser(
         "fetch-article-bodies",
