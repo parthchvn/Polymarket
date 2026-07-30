@@ -139,3 +139,22 @@ database accumulates via snapshot-and-merge —
 The raw layer is append-only with stable primary keys, so the merge
 is idempotent; all normalization/LLM/analysis then runs on
 work.sqlite with zero contention.
+
+
+## Historical dataset import (SII)
+
+``import-sii --db PATH --markets-parquet runs/sii/markets.parquet``
+imports a slice of the SII-WANGZJ/Polymarket_data blockchain dataset
+(1.8M resolved markets, MIT): closed, outcome-recorded markets by
+volume inside a band and date window; trades become canonical
+executions plus maker/taker actor legs with exact block timestamps;
+outcomes populate resolution status and winning side (MarketCensor
+and the O layer at scale).  Historical decisions carry honestly
+missing book/news context — the feature layer's explicit missingness
+handles it.  Provenance: one re-fetchable query per market recorded
+as a raw response (documented exception: the public immutable 21GB
+payload is not duplicated locally).
+
+``--quant-source runs/sii/quant.parquet`` for a local file (download
+once, import, delete — recommended: remote range-scans of the 21GB
+file are slow and fragile); default is the remote HuggingFace URL.
