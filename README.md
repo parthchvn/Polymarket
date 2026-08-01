@@ -1,118 +1,109 @@
-# Polymarket research pipeline
+# Polymarket decision-reasoning pipeline
 
-A research pipeline that studies how identifiable Polymarket actors make
-decisions in response to market state, their positions, their history,
-newly available news, and contract rules.  It reconstructs decision
-episodes using ONLY information available strictly before each decision,
-then tests whether relevant news adds predictive value beyond actor,
-market and position context.
+A research pipeline that reconstructs how identifiable Polymarket
+actors make real decisions — and learns structured
+Decision-Reasoning-Context (DRC) records from them.  Every decision is
+paired with a STRICT pre-decision context (only information available
+before the decision, `available_at < t`, never `<=`), a behavioral
+reasoning inference with explicit uncertainty, and an ex-post outcome
+layer that is structurally quarantined from inference.
 
-**This is a research pipeline, not a trading bot.**  It is read-only
-with respect to Polymarket: no order placement, no wallet signing, no
+**This is a research pipeline, not a trading bot.**  Read-only with
+respect to Polymarket: no order placement, no wallet signing, no
 private keys.
+
+## What it produces
+
+```text
+D  the decision      wallet, market, direction, size, exact timing
+C  strict context    market state, order books, positions, actor
+                     history, screened news, liquidity modes —
+                     everything knowable BEFORE the decision, with
+                     explicit missingness (absence is recorded as
+                     absence, never silently filled)
+R  reasoning         template posteriors + latent behavioral
+                     primitives, accepted only through gates; weak
+                     evidence yields MIXED/ambiguous, thin coverage
+                     yields insufficient_context — refusal is a
+                     first-class answer
+O  outcomes          realised post-decision drift and resolution,
+                     attached as a FINAL export pass; a structural
+                     test proves no outcome ever enters C or R
+```
 
 ## Architecture
 
 ```text
-Polymarket APIs and news sources
-  → immutable raw responses (exact bytes + provenance)
-  → single normalization path
-  → shared normalized SQLite schema (real and synthetic identical)
-  → strict as-of readers (available_at < t, never <=)
-  → decision episodes → features → nested models M0–M3
-  → placebos, bootstraps, candidate news attribution
-  → predictions.csv / metrics.json / config.json / feature_manifest.json
+forward collector (books 60s, trades/news 300s, wallet activity 1h)
+  + historical import (SII blockchain dataset: 1.8M resolved markets)
+  → immutable raw responses (exact bytes + provenance, gaps recorded)
+  → single normalization path (real and synthetic share one schema)
+  → article-body download + LLM claim extraction + relevance v2
+  → liquidity bars → jump-model modes → prequential impact screens
+  → strict as-of decision contexts (paper-derived features included)
+  → DRC records with counterfactuals, calibration, honest abstention
+  → latent reasoning scaffold (rank-K bottleneck; held-out actors
+    AND held-out time; clusters unnamed until stability holds)
+  → human annotation loop (LLM-drafted labels, human-reviewed,
+    Cohen's kappa; consensus-only gold labels)
+  → one-command pipeline → acceptance_report.json (four gates)
 ```
 
-See `docs/ARCHITECTURE.md`, `docs/DATA_CONTRACT.md`,
-`docs/TEMPORAL_VALIDITY.md`, `docs/TRADE_SEMANTICS.md`,
-`docs/OPERATIONS.md`, `docs/RESEARCH_ASSUMPTIONS.md`.
+## The acceptance gates
 
-## Installation
+A reasoning claim is accepted only when it earns it:
+
+1. **Predictive value** — latent R beats the C-only baseline AND the
+   base-rate null on held-out actors and a held-out final time slice.
+2. **Human agreement** — model output vs unanimous human consensus
+   labels on strict pre-decision records.
+3. **Stability** — latent clusters reproduce across seeds
+   (rotation-invariant partition matching).
+4. **Honest abstention** — the DRC status distribution; abstention
+   must fall as coverage grows, tracked across runs.
+
+Refusals state exactly what data would flip them.
+
+## Quickstart
 
 ```bash
-cd ~/Polymarket
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
+pip install -e ".[llm]"           # + duckdb for the historical import
+python -m pytest -q               # the full suite
+
+# continuous collection (own terminal; owns forward.sqlite exclusively)
+python -m polymarket.cli collect-loop --db runs/forward.sqlite \
+  --condition-id 0x... --news-query "..." --book-every 60
+
+# everything else, one command (on a snapshot/work database):
+python -m polymarket.cli reasoning-pipeline --db runs/work.sqlite \
+  --output runs/daily --reasoning-model runs/model/reasoning_model.json
+cat runs/daily/acceptance_report.json
+
+# historical scale (blockchain dataset, resolved outcomes):
+python -m polymarket.cli import-sii --db runs/history.sqlite \
+  --markets-parquet runs/sii/markets.parquet \
+  --quant-source runs/sii/quant.parquet --top-n 50
 ```
 
-Requires Python 3.11+.
+Operational pattern: the collector owns its database exclusively;
+analysis and LLM work run on a snapshot-merged work database
+(`docs/OPERATIONS.md`).
 
-## Quick start (no network needed)
+## Method notes
 
-```bash
-python -m polymarket.cli init-db --db /tmp/polymarket-empty.sqlite
-python -m polymarket.cli build-synthetic --db /tmp/polymarket-synthetic.sqlite --overwrite
-python -m polymarket.cli audit --db /tmp/polymarket-synthetic.sqlite
-python -m polymarket.cli run-analysis --db /tmp/polymarket-synthetic.sqlite \
-  --output /tmp/polymarket-analysis
-```
+The liquidity-mode and news-impact machinery implements the jump-model
+screening of arXiv 2304.05115 with a genuinely online decoder and
+prequential deployment (each window's news is screened by the PREVIOUS
+cycle's model — no lookahead, with the applied threshold recorded per
+row).  The underreaction analysis follows the drift-regression design
+of the pervasive-underreaction literature with market censoring,
+fresh-endpoint discipline, two-way clustered errors and per-dimension
+refusal.  `docs/PAPER_METHODS.md` records every adaptation and every
+deliberate deviation.
 
-## CLI
+## Documentation
 
-| command | purpose |
-|---|---|
-| `init-db --db PATH` | create the schema |
-| `collect --db PATH --surface trades --condition-id ID` | live collection (both trade views) |
-| `normalize --db PATH` | normalize all stored raw responses + reconcile roles |
-| `build-synthetic --db PATH --overwrite` | deterministic synthetic fixture |
-| `audit --db PATH [--json]` | database audit report |
-| `run-analysis --db PATH --output DIR` | replay, models, placebos, outputs |
-
-## Tests
-
-```bash
-ruff check src tests
-pytest -q            # no live network required
-pytest -m live       # (reserved) live API probes only
-```
-
-## The temporal rule
-
-Every piece of decision context satisfies `available_at < t` (strict).
-News availability is `first_observed_at` (collector time), never
-publication time.  A runtime assertion rejects contaminated contexts.
-See `docs/TEMPORAL_VALIDITY.md`.
-
-## Time-decayed news features
-
-Semantic relevance is permanent (`relevance_judgments` is never
-rewritten); the decision-specific news signal decays with age using
-half-life weighting over four horizons (6h, 24h, 72h, 168h, capped at 28
-days), so yesterday's news can still inform today's decision at reduced
-weight.  Evidence is aggregated per event family (duplicates take the
-max, independent events add) and positive/negative components remain
-separate.  No news at or after the decision time ever contributes.  All
-decay parameters are recorded in `config.json` and
-`feature_manifest.json`; the half-lives are modelling choices, not
-established causal parameters.
-
-## Reasoning Layer 1: predictive driver attribution
-
-Each analysis run emits `reasoning.json` and populates the
-`reasoning_judgments` table with one record per labeled decision: exact
-per-channel logit contributions and refit ablation deltas over separate
-channels (base, actor, market_trend, liquidity, position, fresh_news,
-persistent_news), plus strict pre-decision news evidence.  These are
-predictive attributions, not mechanism inference — template posteriors
-(e.g. fresh reaction vs delayed underreaction) are a reserved later
-layer.  No post-trade market response ever enters a decision's record.
-
-## Data safety
-
-- Raw observations are immutable and append-only.
-- Never commit `.env`, API keys, wallet secrets, or production
-  databases (`.gitignore` enforces the common cases).
-- The committed `fixtures/synthetic_normalized.sqlite` is fully
-  synthetic and safe.
-
-## Limitations
-
-- All collectors are fixture/mock-tested; live API payload shapes and
-  historical parameter semantics are unvalidated (see
-  `docs/RESEARCH_ASSUMPTIONS.md`).
-- News attribution output is candidate attribution, never causal.
-- Historical completeness is never claimed unless demonstrated by
-  backfill validation.
+`docs/ARCHITECTURE.md` · `docs/DATA_CONTRACT.md` ·
+`docs/TEMPORAL_VALIDITY.md` · `docs/TRADE_SEMANTICS.md` ·
+`docs/OPERATIONS.md` · `docs/PAPER_METHODS.md` ·
+`docs/RESEARCH_ASSUMPTIONS.md`
