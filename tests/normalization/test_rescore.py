@@ -768,3 +768,121 @@ def test_download_article_bodies_provenance_and_honesty(tmp_path):
         "WHERE extractor_version = 'body-v1'"
     ).fetchone()
     assert claim[0] > now       # download time, not RSS time (1000.0)
+
+
+def test_batched_relevance_through_ingestion(tmp_path):
+    """A scorer exposing score_many gets ONE call per claim covering
+    every market; results map back positionally; None slots are
+    honestly unscored; and the batched model version is what lands in
+    the judgments."""
+    from polymarket.contracts.schema import init_db
+    from polymarket.normalization.news import backfill_llm_claims
+
+    conn = init_db(str(tmp_path / "batch.sqlite"), description="b")
+    now = time.time()
+    for k in ("1", "2", "3"):
+        conn.execute(
+            "INSERT INTO markets (market_id, condition_id, question, "
+            "raw_response_id, raw_record_index, raw_record_hash, "
+            "parser_version, schema_version, normalized_at) VALUES "
+            "(?, ?, ?, 1, 0, 'h', 'p', 2, ?)",
+            (f"m-{k}", f"0xb{k}", f"Question {k}?", now),
+        )
+        conn.execute(
+            "INSERT INTO contract_versions (market_id, version_seq, "
+            "effective_from, first_observed_at, question, rules_text, "
+            "content_hash, raw_response_id, parser_version, "
+            "schema_version, normalized_at) VALUES (?, 1, 0, 0, ?, "
+            "'rules', ?, 1, 'p', 2, ?)",
+            (f"m-{k}", f"Question {k}?", f"chb-{k}", now),
+        )
+    conn.execute(
+        "INSERT INTO news_articles (article_id, source_id, source_url, "
+        "source_published_at, first_observed_at, "
+        "download_completed_at, timestamp_source, "
+        "timestamp_confidence, headline, body, content_hash, "
+        "raw_response_id, raw_record_index, raw_record_hash, "
+        "parser_version, schema_version, normalized_at) VALUES "
+        "('art-b', 's', 'u', 900, 900, 900, 'feed', 0.8, 'h', ?, "
+        "'chb', 1, 0, 'h', 'p', 1, ?)",
+        ("x" * 500, now),
+    )
+    conn.commit()
+
+    class Extractor:
+        version = "batch-ex-v1"
+
+        def extract(self, headline, body):
+            return [{"claim_text": "the claim", "entities": [],
+                     "quantities": [], "confidence": 0.9}]
+
+    class BatchScorer:
+        method = "ollama_llm"
+        version = "canned-relevance-v2b"
+
+        def __init__(self):
+            self.calls = 0
+
+        def score_many(self, claim_text, markets):
+            self.calls += 1
+            assert len(markets) == 3
+            # market 2 deliberately unscored (model skipped an index)
+            return [
+                {"rel_class": "indirect", "rel_score": 0.7,
+                 "direction": 0.1, "evidence": {"batched": True}},
+                None,
+                {"rel_class": "irrelevant", "rel_score": 0.9,
+                 "direction": 0.0, "evidence": {"batched": True}},
+            ]
+
+    scorer = BatchScorer()
+    backfill_llm_claims(
+        conn, Extractor(), scorer,
+        min_body_chars=100, relevance_filter=False,
+    )
+    assert scorer.calls == 1                 # ONE call, three markets
+    rows = conn.execute(
+        "SELECT market_id, rel_class, model_version FROM "
+        "relevance_judgments WHERE model_version = "
+        "'canned-relevance-v2b' ORDER BY market_id"
+    ).fetchall()
+    assert [(r[0], r[1]) for r in rows] == [
+        ("m-1", "indirect"), ("m-3", "irrelevant"),
+    ]                                        # m-2 honestly unscored
+
+
+def test_batch_scorer_result_mapping():
+    """Positional mapping guards: out-of-range indices dropped,
+    duplicate indices keep the first, missing indices stay None."""
+    llm_news = pytest.importorskip("polymarket.normalization.llm_news")
+
+    class Judgment:
+        def __init__(self, index):
+            self.market_index = index
+            self.rel_class = "background"
+            self.rel_score = 0.5
+            self.direction = 0.0
+            self.directness = "unclear"
+            self.reasoning_summary = "r"
+            self.supporting_rule_span = "s"
+            self.confidence = 0.5
+
+    class Parsed:
+        judgments = [Judgment(0), Judgment(0), Judgment(5),
+                     Judgment(2)]
+
+    results: list = [None] * 3
+    for judgment in Parsed.judgments:
+        index = judgment.market_index
+        if not (0 <= index < len(results)):
+            continue
+        if results[index] is not None:
+            continue
+        results[index] = {"rel_class": judgment.rel_class}
+    assert results[0] == {"rel_class": "background"}
+    assert results[1] is None
+    assert results[2] == {"rel_class": "background"}
+    # version discipline: batched scorer is v2b, never v2
+    assert llm_news.OllamaBatchRelevanceScorer(
+        "qwen3:8b"
+    ).version.endswith("relevance-v2b")

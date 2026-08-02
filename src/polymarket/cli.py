@@ -356,10 +356,18 @@ def cmd_extract_claims(args) -> int:
         ) from exc
     from polymarket.normalization.news import backfill_llm_claims
 
+    if args.single_call_relevance:
+        scorer = OllamaRelevanceScorer(args.model)
+    else:
+        from polymarket.normalization.llm_news import (
+            OllamaBatchRelevanceScorer,
+        )
+
+        scorer = OllamaBatchRelevanceScorer(args.model)
     report = backfill_llm_claims(
         conn,
         OllamaClaimExtractor(args.model),
-        OllamaRelevanceScorer(args.model),
+        scorer,
         limit=args.limit,
         order=args.order,
         min_body_chars=args.min_body_chars,
@@ -907,6 +915,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-rel-score", type=float, default=0.03)
     p.add_argument("--no-relevance-filter", action="store_true",
                    help="extract regardless of rule-scored relevance")
+    p.add_argument("--single-call-relevance", action="store_true",
+                   help="score each (claim, market) with its own LLM "
+                        "call (v2) instead of the batched v2b scorer")
     p.set_defaults(func=cmd_extract_claims)
 
     p = sub.add_parser(

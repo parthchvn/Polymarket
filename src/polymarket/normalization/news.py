@@ -332,14 +332,26 @@ def ingest_claims_for_article(
         result.add_inserted("claim_edges")
 
         # ---- relevance judgments -------------------------------------
-        for market in markets:
-            if market["version_seq"] is None:
-                continue
-            scored = scorer.score(
-                claim["claim_text"], market["question"], market["rules_text"]
+        scoreable = [m for m in markets if m["version_seq"] is not None]
+        if hasattr(scorer, "score_many"):
+            # batched: one LLM call scores this claim against every
+            # market (claims x markets calls collapse to claims)
+            batch = scorer.score_many(
+                claim["claim_text"],
+                [{"question": m["question"],
+                  "rules_text": m["rules_text"]} for m in scoreable],
             )
+            scored_pairs = list(zip(scoreable, batch))
+        else:
+            scored_pairs = [
+                (m, scorer.score(
+                    claim["claim_text"], m["question"], m["rules_text"]
+                ))
+                for m in scoreable
+            ]
+        for market, scored in scored_pairs:
             if scored is None:
-                continue        # scoring budget deferred this claim
+                continue    # deferred by budget, or unscored in batch
             novelty = 1.0 if edge_type == "new" else 0.3
             model_version = getattr(
                 scorer, "version", RELEVANCE_MODEL_VERSION
