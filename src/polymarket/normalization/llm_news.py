@@ -317,6 +317,147 @@ ARTICLE BODY:
         return output
 
 
+class MarketRelevance(BaseModel):
+    market_index: int
+    rel_class: Literal[
+        "supports_positive", "supports_negative", "indirect",
+        "background", "irrelevant", "ambiguous",
+    ]
+    rel_score: float
+    direction: float
+    directness: Literal["direct", "indirect", "unclear"]
+    reasoning_summary: str
+    supporting_rule_span: str
+    confidence: float
+
+
+class BatchRelevanceResult(BaseModel):
+    judgments: list[MarketRelevance]
+
+
+class OllamaBatchRelevanceScorer:
+    """Score one claim against ALL markets in a single structured
+    call — the per-article LLM cost drops from claims x markets to
+    claims (a ~3x saving at three markets, more as markets grow).
+
+    Provenance discipline: batching changes the prompt, so the model
+    version carries a distinct ``-v2b`` suffix — batched and
+    single-call judgments never mix silently, and the pinned analysis
+    contract can select either.  Semantics (the v2 indirect/background
+    /irrelevant guidance) are identical by construction: the rules
+    text is shared verbatim with the single scorer.
+
+    Markets are addressed by INDEX in the structured output and mapped
+    back positionally; a judgment for an unknown index or a missing
+    market is dropped (recorded by the caller as unscored rather than
+    guessed)."""
+
+    method = "ollama_llm"
+
+    def __init__(self, model: str = "qwen3:8b") -> None:
+        self.model = model
+        self.version = f"ollama-{model}-relevance-v2b"
+
+    def score_many(
+        self,
+        claim_text: str,
+        markets: list[dict],
+    ) -> list[dict | None]:
+        """markets: [{"question": ..., "rules_text": ...}, ...] ->
+        one result (or None) per market, order-aligned."""
+        blocks = []
+        for index, market in enumerate(markets):
+            blocks.append(
+                f"MARKET {index}:\nQUESTION: {market['question']}\n"
+                f"RULES: {market.get('rules_text') or ''}"
+            )
+        markets_block = "\n\n".join(blocks)
+        prompt = f"""
+You evaluate whether a news claim is relevant to EACH of several
+binary prediction markets.  Judge every market independently.
+
+Definitions:
+- supports_positive: the claim provides evidence that the market's positive
+  proposition is true or more likely to resolve positive.
+- supports_negative: the claim provides evidence that the positive proposition
+  is false or more likely to resolve negative.
+- indirect: related information that may affect the proposition but does not
+  directly satisfy or contradict the resolution condition.
+- background: topically related but weakly decision-relevant.
+- irrelevant: unrelated to the market's resolution.
+- ambiguous: relation or direction cannot be determined reliably.
+
+Rules:
+1. Use only the supplied claim, market question, and market rules.
+2. Do not use outside knowledge.
+3. Interpret relevance using the exact resolution rules.
+4. rel_score must be between 0 and 1.
+5. direction must be between -1 and 1:
+   positive supports the positive proposition;
+   negative supports the negative proposition.
+6. Do not confuse news importance with contract relevance.
+7. Use indirect when a claim meaningfully informs the likelihood of the
+   proposition through intentions, capabilities, military readiness,
+   resource constraints, diplomacy, escalation, negotiations, or planning,
+   even when it does not itself satisfy the resolution condition.
+8. Use background for topically related information that provides little
+   directional evidence about the proposition.
+9. Use irrelevant only when there is no plausible informational or causal
+   connection to the proposition.
+10. Do not classify a claim as irrelevant merely because it does not directly
+    satisfy the resolution condition.
+11. supporting_rule_span should quote exact wording from that market's
+    question or rules.
+12. Return one judgment per market, tagged with its market_index.
+13. Return only the required structured output.
+
+CLAIM:
+{claim_text}
+
+{markets_block}
+"""
+        response = chat(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            format=BatchRelevanceResult.model_json_schema(),
+            think=False,
+            keep_alive="30m",
+            options={
+                "temperature": 0,
+                "num_ctx": 8192,
+            },
+        )
+        content = response.message.content or ""
+        if len(content) > MAX_EXTRACTION_RESPONSE_CHARS:
+            raise ValueError(
+                f"degenerate batch relevance response "
+                f"({len(content)} chars)"
+            )
+        parsed = BatchRelevanceResult.model_validate_json(content)
+        results: list[dict | None] = [None] * len(markets)
+        for judgment in parsed.judgments:
+            index = judgment.market_index
+            if not (0 <= index < len(markets)):
+                continue                    # unknown index: unscored
+            if results[index] is not None:
+                continue                    # first judgment wins
+            results[index] = {
+                "rel_class": judgment.rel_class,
+                "rel_score": float(judgment.rel_score),
+                "direction": float(judgment.direction),
+                "evidence": {
+                    "directness": judgment.directness,
+                    "reasoning_summary": judgment.reasoning_summary,
+                    "supporting_rule_span":
+                        judgment.supporting_rule_span,
+                    "confidence": min(float(judgment.confidence),
+                                      0.99),
+                    "batched": True,
+                },
+            }
+        return results
+
+
 class OllamaRelevanceScorer:
     """Compare an extracted claim with exact market resolution semantics."""
 
