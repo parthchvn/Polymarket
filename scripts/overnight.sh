@@ -5,18 +5,33 @@
 # merges new raw responses into runs/nightly/work.sqlite, where all
 # normalization, LLM scoring, and analysis happen with no contention.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 mkdir -p runs/nightly
 
 snapshot_and_merge() {
 python3 - <<'PY'
 import sqlite3
 
+import os, sys
+
 def backup(src, dst):
     a = sqlite3.connect(src, timeout=60)
     b = sqlite3.connect(dst)
     a.backup(b)
     b.close(); a.close()
+
+# GUARD: sqlite3.connect silently CREATES a missing file — an empty
+# database must never masquerade as the collector's. Refuse loudly.
+if not os.path.exists("runs/forward.sqlite"):
+    sys.exit("runs/forward.sqlite does not exist — is the collector "
+             "running, and is this script running from the repo root?")
+probe = sqlite3.connect("runs/forward.sqlite", timeout=60)
+tables = {r[0] for r in probe.execute(
+    "SELECT name FROM sqlite_master WHERE type='table'")}
+probe.close()
+if "raw_responses" not in tables:
+    sys.exit("runs/forward.sqlite has no raw_responses table — "
+             "refusing to snapshot an empty or foreign database")
 
 backup("runs/forward.sqlite", "runs/nightly/snap.sqlite")
 import os
